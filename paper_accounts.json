@@ -1,0 +1,27 @@
+{
+  "user_1": {
+    "userId": "user_1",
+    "cash": 97441.74422668458,
+    "positions": [
+      {
+        "ticker": "MSFT",
+        "quantity": 5.0,
+        "avgCostBasis": 511.65115466308595
+      }
+    ],
+    "orders": [
+      {
+        "orderId": "order_1",
+        "ticker": "MSFT",
+        "type": "market",
+        "side": "buy",
+        "quantity": 5.0,
+        "filledPrice": 511.65115466308595,
+        "filledQuantity": 5.0,
+        "status": "filled",
+        "timestamp": "2025-11-12T22:30:14.141163"
+      }
+    ],
+    "createdAt": "2025-11-12T22:27:42.598043"
+  }
+}
