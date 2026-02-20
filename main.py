@@ -162,12 +162,15 @@ def verify_token(authorization: Optional[str] = None) -> dict:
 # Routes
 @app.get("/")
 def read_root():
-    """Health check endpoint"""
     return {
         "service": "Paper Trading Service",
         "status": "running",
         "version": "1.0.0"
     }
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "service": "paper-trading-service"}
 
 @app.get("/api/paper/account", response_model=PaperAccount)
 def get_account(token_data: dict = Depends(verify_token)):
