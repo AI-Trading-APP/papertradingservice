@@ -178,7 +178,7 @@ def health_check():
 @app.get("/api/paper/account", response_model=PaperAccount)
 def get_account(token_data: dict = Depends(verify_token)):
     """Get paper trading account"""
-    user_id = token_data.get("user_id")
+    user_id = str(token_data.get("user_id"))
     accounts = load_accounts()
 
     # Initialize account if doesn't exist
@@ -200,7 +200,7 @@ def get_account(token_data: dict = Depends(verify_token)):
 @app.post("/api/paper/order", response_model=OrderResponse)
 def place_order(order: Order, token_data: dict = Depends(verify_token)):
     """Place a paper trading order"""
-    user_id = token_data.get("user_id")
+    user_id = str(token_data.get("user_id"))
     accounts = load_accounts()
 
     if user_id not in accounts:
@@ -335,7 +335,7 @@ def place_order(order: Order, token_data: dict = Depends(verify_token)):
 @app.post("/api/paper/reset")
 def reset_account(token_data: dict = Depends(verify_token)):
     """Reset paper trading account to starting state"""
-    user_id = token_data.get("user_id")
+    user_id = str(token_data.get("user_id"))
     accounts = load_accounts()
 
     accounts[user_id] = {
@@ -353,7 +353,7 @@ def reset_account(token_data: dict = Depends(verify_token)):
 @app.get("/api/paper/orders")
 def get_orders(token_data: dict = Depends(verify_token)):
     """Get order history"""
-    user_id = token_data.get("user_id")
+    user_id = str(token_data.get("user_id"))
     accounts = load_accounts()
 
     if user_id not in accounts:
