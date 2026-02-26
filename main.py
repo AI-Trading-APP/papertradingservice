@@ -87,34 +87,44 @@ def save_accounts(accounts: Dict):
         json.dump(accounts, f, indent=2)
 
 def get_current_price(ticker: str) -> float:
-    """Get current stock price from yfinance with retry logic"""
+    """Get current stock price with write-through cache and retry."""
     import time
+    from price_cache import price_cache, PRICE_TTL
+
+    cache_key = f"price:{ticker}"
+    cached, is_fresh = price_cache.get(cache_key)
+    if cached is not None and is_fresh:
+        return cached
+
     max_retries = 3
     for attempt in range(max_retries):
         try:
             stock = yf.Ticker(ticker)
-            # Try to get today's data first
             data = stock.history(period="1d")
             if not data.empty:
-                return float(data['Close'].iloc[-1])
+                price = float(data['Close'].iloc[-1])
+                price_cache.set(cache_key, price, PRICE_TTL)
+                return price
 
-            # If today's data is not available, try 5 days
             data = stock.history(period="5d")
             if not data.empty:
-                return float(data['Close'].iloc[-1])
+                price = float(data['Close'].iloc[-1])
+                price_cache.set(cache_key, price, PRICE_TTL)
+                return price
 
-            # If still no data, wait and retry
             if attempt < max_retries - 1:
                 time.sleep(1)
                 continue
-
-            return 0.0
         except Exception as e:
             print(f"Error fetching price for {ticker} (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(1)
-            else:
-                return 0.0
+
+    # All retries failed — serve stale cache
+    stale = price_cache.get_stale(cache_key)
+    if stale is not None:
+        print(f"  Serving stale cached price for {ticker}: {stale}")
+        return stale
     return 0.0
 
 def apply_slippage(price: float, side: str) -> float:
@@ -173,7 +183,8 @@ def read_root():
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "service": "paper-trading-service"}
+    from price_cache import price_cache
+    return {"status": "healthy", "service": "paper-trading-service", "cache": price_cache.stats()}
 
 @app.get("/api/paper/account", response_model=PaperAccount)
 def get_account(token_data: dict = Depends(verify_token)):
