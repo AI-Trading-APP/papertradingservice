@@ -150,12 +150,11 @@ def test_root_endpoint(client):
     body = resp.json()
     assert body["service"] == "Paper Trading Service"
     assert body["status"] == "running"
-    assert body["version"] == "1.0.0"
+    assert body["version"] == "2.0.0"
 
 
-def test_order_on_nonexistent_account(client, tmp_accounts_file):
-    """Placing an order when the user has no account returns 404 (line 218)."""
-    # Write an empty accounts file so user_1 does NOT exist
+def test_order_on_new_account_auto_creates(client, tmp_accounts_file):
+    """Placing an order when user has no account auto-creates one and succeeds."""
     import json
     with open(tmp_accounts_file, "w") as f:
         json.dump({}, f)
@@ -163,8 +162,9 @@ def test_order_on_nonexistent_account(client, tmp_accounts_file):
     resp = client.post("/api/paper/order", json={
         "ticker": "AAPL", "type": "market", "side": "buy", "quantity": 1,
     })
-    assert resp.status_code == 404
-    assert "Account not found" in resp.json()["detail"]
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "filled"
 
 
 def test_limit_order_without_limit_price(client, seeded_account):

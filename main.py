@@ -7,16 +7,21 @@ from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
+import logging
 import yfinance as yf
 import random
+
+from storage import StorageAdapter
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Paper Trading Service",
     description="Simulated trading environment",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # CORS configuration from environment
@@ -31,13 +36,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Data file
-PAPER_ACCOUNTS_FILE = "paper_accounts.json"
+# Storage adapter (replaces direct JSON read/write)
+storage = StorageAdapter()
 
 # Trading configuration
 SLIPPAGE_PERCENT = 0.1  # 0.1% slippage
 COMMISSION_PER_TRADE = 0.0  # $0 commission (like Robinhood)
 STARTING_CASH = 100000.0  # $100,000 starting capital
+
+# Data file — kept for backward compatibility with tests
+PAPER_ACCOUNTS_FILE = "paper_accounts.json"
 
 # Models
 class Order(BaseModel):
@@ -71,9 +79,10 @@ class PaperAccount(BaseModel):
     totalValue: Optional[float] = None
     totalPL: Optional[float] = None
     totalPLPercent: Optional[float] = None
-    createdAt: str
+    createdAt: Optional[str] = None
 
-# Helper functions
+
+# Backward-compatible helpers (used by tests that patch PAPER_ACCOUNTS_FILE)
 def load_accounts() -> Dict:
     """Load paper trading accounts from file"""
     if os.path.exists(PAPER_ACCOUNTS_FILE):
@@ -85,6 +94,7 @@ def save_accounts(accounts: Dict):
     """Save paper trading accounts to file"""
     with open(PAPER_ACCOUNTS_FILE, 'w') as f:
         json.dump(accounts, f, indent=2)
+
 
 def get_current_price(ticker: str) -> float:
     """Get current stock price with write-through cache and retry."""
@@ -116,14 +126,14 @@ def get_current_price(ticker: str) -> float:
                 time.sleep(1)
                 continue
         except Exception as e:
-            print(f"Error fetching price for {ticker} (attempt {attempt + 1}/{max_retries}): {e}")
+            logger.warning(f"Error fetching price for {ticker} (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(1)
 
     # All retries failed — serve stale cache
     stale = price_cache.get_stale(cache_key)
     if stale is not None:
-        print(f"  Serving stale cached price for {ticker}: {stale}")
+        logger.info(f"Serving stale cached price for {ticker}: {stale}")
         return stale
     return 0.0
 
@@ -131,41 +141,34 @@ def apply_slippage(price: float, side: str) -> float:
     """Apply realistic slippage to order execution"""
     slippage = price * (SLIPPAGE_PERCENT / 100)
     if side == "buy":
-        # Buy orders get filled slightly higher
         return price + slippage
     else:
-        # Sell orders get filled slightly lower
         return price - slippage
 
 def calculate_account_metrics(account: Dict) -> Dict:
     """Calculate account metrics with current prices"""
     total_market_value = account['cash']
     initial_value = STARTING_CASH
-    
+
     for position in account['positions']:
-        # Get current price
         current_price = get_current_price(position['ticker'])
         position['currentPrice'] = current_price
-        
-        # Calculate market value
+
         market_value = position['quantity'] * current_price
         position['marketValue'] = market_value
-        
-        # Calculate cost basis
+
         cost_basis = position['quantity'] * position['avgCostBasis']
-        
-        # Calculate unrealized P&L
+
         unrealized_pl = market_value - cost_basis
         position['unrealizedPL'] = unrealized_pl
         position['unrealizedPLPercent'] = (unrealized_pl / cost_basis * 100) if cost_basis > 0 else 0
-        
+
         total_market_value += market_value
-    
-    # Calculate total P&L
+
     account['totalValue'] = total_market_value
     account['totalPL'] = total_market_value - initial_value
     account['totalPLPercent'] = (account['totalPL'] / initial_value * 100) if initial_value > 0 else 0
-    
+
     return account
 
 def verify_token(authorization: Optional[str] = None) -> dict:
@@ -178,46 +181,37 @@ def read_root():
     return {
         "service": "Paper Trading Service",
         "status": "running",
-        "version": "1.0.0"
+        "version": "2.0.0",
+        "storage_mode": storage.mode,
     }
 
 @app.get("/health")
 def health_check():
     from price_cache import price_cache
-    return {"status": "healthy", "service": "paper-trading-service", "cache": price_cache.stats()}
+    from database import check_db_connection
+    return {
+        "status": "healthy",
+        "service": "paper-trading-service",
+        "cache": price_cache.stats(),
+        "storage_mode": storage.mode,
+        "db_connected": check_db_connection() if storage.mode != "json_only" else None,
+    }
 
 @app.get("/api/paper/account", response_model=PaperAccount)
 def get_account(token_data: dict = Depends(verify_token)):
     """Get paper trading account"""
     user_id = str(token_data.get("user_id"))
-    accounts = load_accounts()
-
-    # Initialize account if doesn't exist
-    if user_id not in accounts:
-        accounts[user_id] = {
-            "userId": user_id,
-            "cash": STARTING_CASH,
-            "positions": [],
-            "orders": [],
-            "createdAt": datetime.utcnow().isoformat()
-        }
-        save_accounts(accounts)
-
-    account = accounts[user_id]
+    account = storage.get_account(user_id)
     account = calculate_account_metrics(account)
-
     return account
 
 @app.post("/api/paper/order", response_model=OrderResponse)
 def place_order(order: Order, token_data: dict = Depends(verify_token)):
     """Place a paper trading order"""
     user_id = str(token_data.get("user_id"))
-    accounts = load_accounts()
 
-    if user_id not in accounts:
-        raise HTTPException(status_code=404, detail="Account not found")
-
-    account = accounts[user_id]
+    # Ensure account exists
+    storage.get_account(user_id)
 
     # Get current market price
     market_price = get_current_price(order.ticker)
@@ -238,7 +232,6 @@ def place_order(order: Order, token_data: dict = Depends(verify_token)):
                 status="rejected",
                 message="Limit price required for limit orders"
             )
-        # For paper trading, execute limit orders immediately if price is favorable
         if order.side == "buy" and order.limitPrice >= market_price:
             execution_price = order.limitPrice
         elif order.side == "sell" and order.limitPrice <= market_price:
@@ -250,129 +243,39 @@ def place_order(order: Order, token_data: dict = Depends(verify_token)):
                 message="Limit price not favorable for immediate execution"
             )
 
-    # Execute order
-    if order.side == "buy":
-        total_cost = order.quantity * execution_price + COMMISSION_PER_TRADE
-
-        if account['cash'] < total_cost:
-            return OrderResponse(
-                orderId="",
-                status="rejected",
-                message="Insufficient funds"
-            )
-
-        # Deduct cash
-        account['cash'] -= total_cost
-
-        # Find or create position
-        existing_position = None
-        for pos in account['positions']:
-            if pos['ticker'] == order.ticker:
-                existing_position = pos
-                break
-
-        if existing_position:
-            # Update average cost basis
-            total_quantity = existing_position['quantity'] + order.quantity
-            total_cost_basis = (existing_position['quantity'] * existing_position['avgCostBasis']) + (order.quantity * execution_price)
-            existing_position['avgCostBasis'] = total_cost_basis / total_quantity
-            existing_position['quantity'] = total_quantity
-        else:
-            # Add new position
-            account['positions'].append({
-                "ticker": order.ticker,
-                "quantity": order.quantity,
-                "avgCostBasis": execution_price
-            })
-
-    else:  # sell
-        # Find position
-        position = None
-        for pos in account['positions']:
-            if pos['ticker'] == order.ticker:
-                position = pos
-                break
-
-        if not position:
-            return OrderResponse(
-                orderId="",
-                status="rejected",
-                message="No position to sell"
-            )
-
-        if position['quantity'] < order.quantity:
-            return OrderResponse(
-                orderId="",
-                status="rejected",
-                message="Insufficient shares"
-            )
-
-        # Calculate proceeds
-        proceeds = (order.quantity * execution_price) - COMMISSION_PER_TRADE
-
-        # Add cash
-        account['cash'] += proceeds
-
-        # Update or remove position
-        position['quantity'] -= order.quantity
-
-        if position['quantity'] == 0:
-            account['positions'].remove(position)
-
-    # Record order
-    order_id = f"order_{len(account['orders']) + 1}"
-    account['orders'].append({
-        "orderId": order_id,
-        "ticker": order.ticker,
-        "type": order.type,
-        "side": order.side,
-        "quantity": order.quantity,
-        "filledPrice": execution_price,
-        "filledQuantity": order.quantity,
-        "status": "filled",
-        "timestamp": datetime.utcnow().isoformat()
-    })
-
-    save_accounts(accounts)
-
-    return OrderResponse(
-        orderId=order_id,
-        status="filled",
-        filledPrice=execution_price,
-        filledQuantity=order.quantity,
-        message=f"Order filled at ${execution_price:.2f}"
-    )
+    # Execute order via storage adapter
+    try:
+        result = storage.place_order(
+            user_id=user_id,
+            ticker=order.ticker,
+            order_type=order.type,
+            side=order.side,
+            quantity=order.quantity,
+            execution_price=execution_price,
+            limit_price=order.limitPrice,
+        )
+        return OrderResponse(**result)
+    except ValueError as e:
+        return OrderResponse(
+            orderId="",
+            status="rejected",
+            message=str(e),
+        )
 
 @app.post("/api/paper/reset")
 def reset_account(token_data: dict = Depends(verify_token)):
     """Reset paper trading account to starting state"""
     user_id = str(token_data.get("user_id"))
-    accounts = load_accounts()
-
-    accounts[user_id] = {
-        "userId": user_id,
-        "cash": STARTING_CASH,
-        "positions": [],
-        "orders": [],
-        "createdAt": datetime.utcnow().isoformat()
-    }
-
-    save_accounts(accounts)
-
-    return {"message": "Account reset successfully", "startingCash": STARTING_CASH}
+    result = storage.reset_account(user_id)
+    return result
 
 @app.get("/api/paper/orders")
 def get_orders(token_data: dict = Depends(verify_token)):
     """Get order history"""
     user_id = str(token_data.get("user_id"))
-    accounts = load_accounts()
-
-    if user_id not in accounts:
-        return {"orders": []}
-
-    return {"orders": accounts[user_id]['orders']}
+    orders = storage.get_orders(user_id)
+    return {"orders": orders}
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8005)
-

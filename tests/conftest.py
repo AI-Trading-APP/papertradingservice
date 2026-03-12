@@ -1,8 +1,9 @@
 """
 Shared fixtures for PaperTradingService tests.
 
+- STORAGE_MODE defaults to json_only for all existing tests (no DB required).
 - Patches yfinance so no real network calls are made.
-- Redirects JSON storage to a tmp directory per test.
+- storage.PAPER_ACCOUNTS_FILE is patched to write into a tmp directory per test.
 - Provides authenticated TestClient and helper functions.
 """
 
@@ -17,6 +18,14 @@ from fastapi.testclient import TestClient
 _PARENT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
+
+# Also add the service directory itself so bare imports (storage, database, etc.) resolve
+_SERVICE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SERVICE_DIR not in sys.path:
+    sys.path.insert(0, _SERVICE_DIR)
+
+# Force json_only mode for tests (no DB required)
+os.environ.setdefault("STORAGE_MODE", "json_only")
 
 # ---------------------------------------------------------------------------
 # Inject a mock 'price_cache' module into sys.modules BEFORE importing
@@ -38,10 +47,18 @@ class _FakePriceCache:
         pass
     def stats(self):
         return {"hits": 0, "misses": 0, "size": 0}
+    def clear(self):
+        pass
 
 _mock_price_cache_module.price_cache = _FakePriceCache()
 _mock_price_cache_module.PRICE_TTL = 30
 sys.modules.setdefault("price_cache", _mock_price_cache_module)
+
+# ---------------------------------------------------------------------------
+# Database module will be imported by storage.py but won't connect in
+# json_only mode. We set DATABASE_URL to sqlite to avoid needing psycopg2.
+# ---------------------------------------------------------------------------
+os.environ.setdefault("DATABASE_URL", "sqlite:///test_paper_trading.db")
 
 # ---------------------------------------------------------------------------
 # Mock price map — used by the yfinance patch
@@ -82,11 +99,14 @@ def _patch_yfinance():
 def tmp_accounts_file(tmp_path, monkeypatch):
     """
     Redirect PAPER_ACCOUNTS_FILE to a temp directory so tests are isolated
-    and never touch real data.
+    and never touch real data. Patches both storage and main modules.
     """
     tmp_file = str(tmp_path / "paper_accounts.json")
-    import papertradingservice.main as mod
-    monkeypatch.setattr(mod, "PAPER_ACCOUNTS_FILE", tmp_file)
+    import papertradingservice.main as main_mod
+    monkeypatch.setattr(main_mod, "PAPER_ACCOUNTS_FILE", tmp_file)
+    # Patch the storage module (bare import used by main.py)
+    import storage as storage_mod
+    monkeypatch.setattr(storage_mod, "PAPER_ACCOUNTS_FILE", tmp_file)
     return tmp_file
 
 
