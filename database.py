@@ -14,8 +14,6 @@ DATABASE_URL = os.getenv(
     "postgresql://ai_trading:ai_trading@localhost:5439/ai_trading_test"
 )
 
-STORAGE_MODE = os.getenv("STORAGE_MODE", "json_only")
-
 if DATABASE_URL.startswith("sqlite"):
     engine = create_engine(
         DATABASE_URL,

@@ -8,11 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from datetime import datetime, timezone
-import json
 import os
 import logging
 import yfinance as yf
-import random
 
 from storage import StorageAdapter
 
@@ -36,16 +34,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Storage adapter (replaces direct JSON read/write)
+# Storage adapter
 storage = StorageAdapter()
 
 # Trading configuration
 SLIPPAGE_PERCENT = 0.1  # 0.1% slippage
 COMMISSION_PER_TRADE = 0.0  # $0 commission (like Robinhood)
 STARTING_CASH = 100000.0  # $100,000 starting capital
-
-# Data file — kept for backward compatibility with tests
-PAPER_ACCOUNTS_FILE = "paper_accounts.json"
 
 # Models
 class Order(BaseModel):
@@ -80,20 +75,6 @@ class PaperAccount(BaseModel):
     totalPL: Optional[float] = None
     totalPLPercent: Optional[float] = None
     createdAt: Optional[str] = None
-
-
-# Backward-compatible helpers (used by tests that patch PAPER_ACCOUNTS_FILE)
-def load_accounts() -> Dict:
-    """Load paper trading accounts from file"""
-    if os.path.exists(PAPER_ACCOUNTS_FILE):
-        with open(PAPER_ACCOUNTS_FILE, 'r') as f:
-            return json.load(f)
-    return {}
-
-def save_accounts(accounts: Dict):
-    """Save paper trading accounts to file"""
-    with open(PAPER_ACCOUNTS_FILE, 'w') as f:
-        json.dump(accounts, f, indent=2)
 
 
 def get_current_price(ticker: str) -> float:
@@ -182,7 +163,7 @@ def read_root():
         "service": "Paper Trading Service",
         "status": "running",
         "version": "2.0.0",
-        "storage_mode": storage.mode,
+        "storage_mode": "pg_only",
     }
 
 @app.get("/health")
@@ -193,8 +174,8 @@ def health_check():
         "status": "healthy",
         "service": "paper-trading-service",
         "cache": price_cache.stats(),
-        "storage_mode": storage.mode,
-        "db_connected": check_db_connection() if storage.mode != "json_only" else None,
+        "storage_mode": "pg_only",
+        "db_connected": check_db_connection(),
     }
 
 @app.get("/api/paper/account", response_model=PaperAccount)

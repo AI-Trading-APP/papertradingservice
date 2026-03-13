@@ -2,7 +2,6 @@
 Edge-case and integration-style tests for PaperTradingService.
 """
 
-import json
 import pytest
 import pandas as pd
 from unittest.mock import patch, MagicMock
@@ -47,7 +46,7 @@ def test_reset_then_trade(client, account_with_position):
     assert acct["positions"][0]["ticker"] == "GOOGL"
 
 
-def test_multiple_users_isolated(client, tmp_accounts_file):
+def test_multiple_users_isolated(client):
     """
     Two different users should have independent accounts.
     We simulate this by overriding verify_token to return different user_ids.
@@ -56,7 +55,7 @@ def test_multiple_users_isolated(client, tmp_accounts_file):
 
     # User A creates account
     resp = client.get("/api/paper/account")
-    assert resp.json()["userId"] == "user_1"
+    assert resp.json()["userId"] == "1"
 
     # User B
     def _user_b():
@@ -65,16 +64,10 @@ def test_multiple_users_isolated(client, tmp_accounts_file):
     app.dependency_overrides[verify_token] = _user_b
     try:
         resp = client.get("/api/paper/account")
-        assert resp.json()["userId"] == "user_2"
+        assert resp.json()["userId"] == "2"
         assert resp.json()["cash"] == 100_000.0
     finally:
         app.dependency_overrides.pop(verify_token, None)
-
-    # Verify both exist in the file
-    with open(tmp_accounts_file) as f:
-        data = json.load(f)
-    assert "user_1" in data
-    assert "user_2" in data
 
 
 def test_expired_token_rejected(client):
@@ -138,13 +131,12 @@ def test_empty_orders_list(client):
 
 
 # ------------------------------------------------------------------
-# Coverage gap tests — lines 97, 111-113, 118-121, 126-127,
-# 178, 218, 236, 297, 371, 376-377
+# Coverage gap tests
 # ------------------------------------------------------------------
 
 
 def test_root_endpoint(client):
-    """GET / returns service info (covers line 178)."""
+    """GET / returns service info."""
     resp = client.get("/")
     assert resp.status_code == 200
     body = resp.json()
@@ -153,12 +145,8 @@ def test_root_endpoint(client):
     assert body["version"] == "2.0.0"
 
 
-def test_order_on_new_account_auto_creates(client, tmp_accounts_file):
+def test_order_on_new_account_auto_creates(client):
     """Placing an order when user has no account auto-creates one and succeeds."""
-    import json
-    with open(tmp_accounts_file, "w") as f:
-        json.dump({}, f)
-
     resp = client.post("/api/paper/order", json={
         "ticker": "AAPL", "type": "market", "side": "buy", "quantity": 1,
     })
@@ -168,7 +156,7 @@ def test_order_on_new_account_auto_creates(client, tmp_accounts_file):
 
 
 def test_limit_order_without_limit_price(client, seeded_account):
-    """Limit order missing limitPrice is rejected (line 236)."""
+    """Limit order missing limitPrice is rejected."""
     resp = client.post("/api/paper/order", json={
         "ticker": "AAPL", "type": "limit", "side": "buy",
         "quantity": 1,
@@ -180,7 +168,7 @@ def test_limit_order_without_limit_price(client, seeded_account):
 
 
 def test_sell_ticker_not_in_positions(client, seeded_account):
-    """Selling a ticker not held returns 'No position to sell' (line 297)."""
+    """Selling a ticker not held returns 'No position to sell'."""
     resp = client.post("/api/paper/order", json={
         "ticker": "GOOGL", "type": "market", "side": "sell", "quantity": 1,
     })
@@ -189,19 +177,15 @@ def test_sell_ticker_not_in_positions(client, seeded_account):
     assert "No position to sell" in body["message"]
 
 
-def test_orders_endpoint_nonexistent_user(client, tmp_accounts_file):
-    """GET /api/paper/orders when user has no account returns empty list (line 371)."""
-    import json
-    with open(tmp_accounts_file, "w") as f:
-        json.dump({}, f)
-
+def test_orders_endpoint_nonexistent_user(client):
+    """GET /api/paper/orders when user has no account returns empty list."""
     resp = client.get("/api/paper/orders")
     assert resp.status_code == 200
     assert resp.json()["orders"] == []
 
 
 def test_get_current_price_fresh_cache_hit(client, seeded_account):
-    """When cache returns a fresh value, yfinance is not called (line 97)."""
+    """When cache returns a fresh value, yfinance is not called."""
     import sys
     cache_mod = sys.modules["price_cache"]
     original_cache = cache_mod.price_cache
@@ -226,10 +210,7 @@ def test_get_current_price_fresh_cache_hit(client, seeded_account):
 
 
 def test_get_current_price_5d_fallback(client, seeded_account):
-    """When 1d history is empty but 5d returns data (lines 111-113)."""
-    import pandas as pd
-    from unittest.mock import MagicMock, call
-
+    """When 1d history is empty but 5d returns data."""
     mock_ticker = MagicMock()
     # First call (1d) returns empty, second call (5d) returns data
     mock_ticker.history.side_effect = [
@@ -244,9 +225,7 @@ def test_get_current_price_5d_fallback(client, seeded_account):
 
 
 def test_get_current_price_exception_with_retry(client, seeded_account):
-    """yfinance raises on all attempts, no stale cache -> 0.0 (lines 118-121)."""
-    from unittest.mock import MagicMock
-
+    """yfinance raises on all attempts, no stale cache -> 0.0."""
     mock_ticker = MagicMock()
     mock_ticker.history.side_effect = Exception("network error")
 
@@ -258,9 +237,8 @@ def test_get_current_price_exception_with_retry(client, seeded_account):
 
 
 def test_get_current_price_stale_cache_fallback(client, seeded_account):
-    """All retries fail but stale cache exists -> returns stale value (lines 126-127)."""
+    """All retries fail but stale cache exists -> returns stale value."""
     import sys
-    from unittest.mock import MagicMock
     cache_mod = sys.modules["price_cache"]
     original_cache = cache_mod.price_cache
 
@@ -289,10 +267,9 @@ def test_get_current_price_stale_cache_fallback(client, seeded_account):
 
 
 def test_main_block_guarded(client):
-    """The if __name__ == '__main__' block does not run on import (lines 376-377)."""
+    """The if __name__ == '__main__' block does not run on import."""
     import papertradingservice.main as mod
     # Verify the guard exists and uvicorn is importable but not auto-called
-    import importlib
     with patch("uvicorn.run") as mock_run:
         # Simulate __main__ execution
         mod.__name__ = "__main__"

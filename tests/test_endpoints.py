@@ -5,7 +5,6 @@ These tests exercise the HTTP interface through FastAPI's TestClient.
 yfinance is mocked globally via conftest.py.
 """
 
-import json
 import pytest
 
 
@@ -33,7 +32,7 @@ def test_get_account_new_user_defaults(client):
     assert body["cash"] == 100_000.0
     assert body["positions"] == []
     assert body["orders"] == []
-    assert body["userId"] == "user_1"
+    assert body["userId"] == "1"
 
 
 def test_get_account_returns_balance_and_positions(client, account_with_position):

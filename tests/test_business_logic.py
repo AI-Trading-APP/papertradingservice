@@ -5,7 +5,6 @@ These verify slippage, position accounting, commission,
 and order-history recording at the HTTP layer.
 """
 
-import json
 import pytest
 
 

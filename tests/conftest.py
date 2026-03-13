@@ -1,17 +1,21 @@
 """
 Shared fixtures for PaperTradingService tests.
 
-- STORAGE_MODE defaults to json_only for all existing tests (no DB required).
-- Patches yfinance so no real network calls are made.
-- storage.PAPER_ACCOUNTS_FILE is patched to write into a tmp directory per test.
-- Provides authenticated TestClient and helper functions.
+Key design decisions:
+- Uses SQLite in-memory database for test isolation (no JSON files).
+- verify_token is a simple mock returning {"user_id": "user_1"}.
+- yfinance is patched globally so no network calls happen.
+- price_cache is a stub that always reports a cache miss.
 """
 
 import os
 import sys
-import json
-import pytest
+from decimal import Decimal
+from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
+
+import pandas as pd
+import pytest
 from fastapi.testclient import TestClient
 
 # Ensure the parent directory is on sys.path so 'papertradingservice.main' is importable
@@ -23,9 +27,6 @@ if _PARENT not in sys.path:
 _SERVICE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SERVICE_DIR not in sys.path:
     sys.path.insert(0, _SERVICE_DIR)
-
-# Force json_only mode for tests (no DB required)
-os.environ.setdefault("STORAGE_MODE", "json_only")
 
 # ---------------------------------------------------------------------------
 # Inject a mock 'price_cache' module into sys.modules BEFORE importing
@@ -54,11 +55,40 @@ _mock_price_cache_module.price_cache = _FakePriceCache()
 _mock_price_cache_module.PRICE_TTL = 30
 sys.modules.setdefault("price_cache", _mock_price_cache_module)
 
-# ---------------------------------------------------------------------------
-# Database module will be imported by storage.py but won't connect in
-# json_only mode. We set DATABASE_URL to sqlite to avoid needing psycopg2.
-# ---------------------------------------------------------------------------
-os.environ.setdefault("DATABASE_URL", "sqlite:///test_paper_trading.db")
+# Force SQLite for tests (must be set before importing database)
+os.environ["DATABASE_URL"] = "sqlite://"
+
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+import database as db_mod
+from models import PaperAccountDB, PaperPositionDB, PaperOrderDB
+
+# Override engine with StaticPool so all connections share the same in-memory DB
+test_engine = create_engine(
+    "sqlite://",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+
+@event.listens_for(test_engine, "connect")
+def _set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
+TestSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+
+# Monkey-patch the database module so StorageAdapter uses our test engine
+db_mod.engine = test_engine
+db_mod.SessionLocal = TestSessionLocal
+
+# Re-import after patching
+Base = db_mod.Base
+engine = test_engine
+SessionLocal = TestSessionLocal
+
 
 # ---------------------------------------------------------------------------
 # Mock price map — used by the yfinance patch
@@ -74,10 +104,7 @@ DEFAULT_MOCK_PRICE = 100.0  # fallback for any unknown ticker
 
 def _make_yf_ticker(ticker_symbol: str):
     """Return a fake yf.Ticker whose .history() yields our mock prices."""
-    import pandas as pd
-
     price = MOCK_PRICES.get(ticker_symbol, DEFAULT_MOCK_PRICE)
-
     mock_ticker = MagicMock()
     mock_df = pd.DataFrame({"Close": [price]})
     mock_ticker.history.return_value = mock_df
@@ -89,25 +116,18 @@ def _make_yf_ticker(ticker_symbol: str):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
+def setup_database():
+    """Create tables before each test, drop after."""
+    Base.metadata.create_all(bind=engine)
+    yield
+    Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture(autouse=True)
 def _patch_yfinance():
     """Globally patch yfinance.Ticker for every test."""
     with patch("yfinance.Ticker", side_effect=_make_yf_ticker):
         yield
-
-
-@pytest.fixture(autouse=True)
-def tmp_accounts_file(tmp_path, monkeypatch):
-    """
-    Redirect PAPER_ACCOUNTS_FILE to a temp directory so tests are isolated
-    and never touch real data. Patches both storage and main modules.
-    """
-    tmp_file = str(tmp_path / "paper_accounts.json")
-    import papertradingservice.main as main_mod
-    monkeypatch.setattr(main_mod, "PAPER_ACCOUNTS_FILE", tmp_file)
-    # Patch the storage module (bare import used by main.py)
-    import storage as storage_mod
-    monkeypatch.setattr(storage_mod, "PAPER_ACCOUNTS_FILE", tmp_file)
-    return tmp_file
 
 
 @pytest.fixture()
@@ -127,53 +147,59 @@ def authed_client(client):
 
 
 @pytest.fixture()
-def seeded_account(tmp_accounts_file):
+def seeded_account():
     """
-    Pre-seed an account for user_1 with starting cash and no positions,
-    then return the path so tests can inspect the file directly.
+    Pre-seed an account for user_id=1 with starting cash and no positions.
     """
-    accounts = {
-        "user_1": {
-            "userId": "user_1",
-            "cash": 100000.0,
-            "positions": [],
-            "orders": [],
-            "createdAt": "2025-01-01T00:00:00",
-        }
-    }
-    with open(tmp_accounts_file, "w") as f:
-        json.dump(accounts, f)
-    return tmp_accounts_file
+    db = SessionLocal()
+    account = PaperAccountDB(
+        user_id=1,
+        cash=Decimal("100000.00"),
+        starting_cash=Decimal("100000.00"),
+        version=1,
+    )
+    db.add(account)
+    db.commit()
+    db.close()
 
 
 @pytest.fixture()
-def account_with_position(tmp_accounts_file):
+def account_with_position():
     """
     Pre-seed an account that already holds 10 shares of AAPL at $225 avg cost.
+    Cash = 100000 - (10 * 225) = 97750
     """
-    accounts = {
-        "user_1": {
-            "userId": "user_1",
-            "cash": 97750.0,
-            "positions": [
-                {"ticker": "AAPL", "quantity": 10, "avgCostBasis": 225.0}
-            ],
-            "orders": [
-                {
-                    "orderId": "order_1",
-                    "ticker": "AAPL",
-                    "type": "market",
-                    "side": "buy",
-                    "quantity": 10,
-                    "filledPrice": 225.0,
-                    "filledQuantity": 10,
-                    "status": "filled",
-                    "timestamp": "2025-01-15T10:00:00",
-                }
-            ],
-            "createdAt": "2025-01-01T00:00:00",
-        }
-    }
-    with open(tmp_accounts_file, "w") as f:
-        json.dump(accounts, f)
-    return tmp_accounts_file
+    db = SessionLocal()
+    account = PaperAccountDB(
+        user_id=1,
+        cash=Decimal("97750.00"),
+        starting_cash=Decimal("100000.00"),
+        version=1,
+    )
+    db.add(account)
+    db.flush()
+
+    position = PaperPositionDB(
+        account_id=account.id,
+        ticker="AAPL",
+        quantity=Decimal("10"),
+        avg_cost_basis=Decimal("225.00"),
+        added_at=datetime(2025, 1, 15, 10, 0, 0, tzinfo=timezone.utc),
+    )
+    db.add(position)
+
+    order = PaperOrderDB(
+        account_id=account.id,
+        ticker="AAPL",
+        order_type="market",
+        side="buy",
+        quantity=Decimal("10"),
+        filled_price=Decimal("225.00"),
+        filled_quantity=Decimal("10"),
+        status="filled",
+        timestamp=datetime(2025, 1, 15, 10, 0, 0, tzinfo=timezone.utc),
+        filled_at=datetime(2025, 1, 15, 10, 0, 0, tzinfo=timezone.utc),
+    )
+    db.add(order)
+    db.commit()
+    db.close()

@@ -20,7 +20,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY main.py .
-COPY paper_accounts.json .
 
 # Create data directory
 RUN mkdir -p /app/data
