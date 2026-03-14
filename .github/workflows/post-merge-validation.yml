@@ -1,0 +1,18 @@
+name: Post-Merge Full Test Suite
+
+on:
+  push:
+    branches: [development]
+
+concurrency:
+  group: post-merge-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  full-suite:
+    uses: AI-Trading-APP/.github/.github/workflows/reusable-python-post-merge.yml@main
+    with:
+      service_name: papertradingservice
+      has_lint: false
+      has_tests: true
+    secrets: inherit
