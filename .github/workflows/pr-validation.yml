@@ -1,0 +1,19 @@
+name: PR Validation
+
+on:
+  pull_request:
+    branches: [development]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    uses: AI-Trading-APP/.github/.github/workflows/reusable-python-pr-validation.yml@main
+    with:
+      service_name: papertradingservice
+      has_lint: false
+      has_tests: true
+    secrets: inherit
