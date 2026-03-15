@@ -126,13 +126,56 @@ def apply_slippage(price: float, side: str) -> float:
     else:
         return price - slippage
 
+def get_batch_prices(tickers: list) -> dict:
+    """Fetch prices for multiple tickers in one yfinance call."""
+    from price_cache import price_cache, PRICE_TTL
+
+    results = {}
+    to_fetch = []
+
+    for ticker in tickers:
+        cache_key = f"price:{ticker}"
+        cached, is_fresh = price_cache.get(cache_key)
+        if cached is not None and is_fresh:
+            results[ticker] = cached
+        else:
+            to_fetch.append(ticker)
+
+    if not to_fetch:
+        return results
+
+    try:
+        df = yf.download(to_fetch, period="5d", threads=True, progress=False)
+        for ticker in to_fetch:
+            try:
+                closes = df["Close"].dropna() if len(to_fetch) == 1 else df[ticker]["Close"].dropna()
+                if not closes.empty:
+                    price = float(closes.iloc[-1])
+                    price_cache.set(f"price:{ticker}", price, PRICE_TTL)
+                    results[ticker] = price
+                else:
+                    results[ticker] = price_cache.get_stale(f"price:{ticker}") or 0.0
+            except Exception:
+                results[ticker] = price_cache.get_stale(f"price:{ticker}") or 0.0
+    except Exception as e:
+        logger.warning(f"Batch price download failed: {e}")
+        for ticker in to_fetch:
+            results[ticker] = price_cache.get_stale(f"price:{ticker}") or 0.0
+
+    return results
+
+
 def calculate_account_metrics(account: Dict) -> Dict:
-    """Calculate account metrics with current prices"""
+    """Calculate account metrics with batch-fetched current prices."""
     total_market_value = account['cash']
     initial_value = STARTING_CASH
 
+    # Batch fetch all prices at once
+    tickers = [p['ticker'] for p in account['positions']]
+    prices = get_batch_prices(tickers) if tickers else {}
+
     for position in account['positions']:
-        current_price = get_current_price(position['ticker'])
+        current_price = prices.get(position['ticker'], 0.0)
         position['currentPrice'] = current_price
 
         market_value = position['quantity'] * current_price

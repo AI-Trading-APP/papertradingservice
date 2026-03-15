@@ -62,7 +62,7 @@ company_cache = PriceCache()    # Company names/metadata (long TTL)
 screener_cache = PriceCache()   # Full screener result sets (medium TTL)
 
 # --- TTL constants (seconds) ---
-PRICE_TTL = 30           # Current prices
+PRICE_TTL = 300          # 5 minutes — stock prices
 COMPANY_NAME_TTL = 86400 # 24 hours
 METADATA_TTL = 3600      # 1 hour (sector, marketCap, PE)
 SCREENER_RESULT_TTL = 60 # Full screener result blob
