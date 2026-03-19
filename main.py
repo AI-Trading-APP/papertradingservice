@@ -19,7 +19,19 @@ from circuit_breaker import yfinance_breaker
 from db_cache import load_cached_prices_from_db, get_price_from_db, save_prices_batch_to_db
 from price_cache import price_cache, PRICE_TTL
 
-logger = logging.getLogger(__name__)
+# EPIC-17: Observability
+from ai_trading_common import (
+    setup_logging, get_logger,
+    CorrelationMiddleware,
+    health_router, DependencyCheck, configure_health,
+    MetricsMiddleware, metrics_endpoint,
+    setup_sentry,
+)
+
+setup_logging("papertradingservice")
+logger = get_logger(__name__)
+
+setup_sentry(service_name="papertradingservice", version="2.0.0")
 
 app = FastAPI(
     title="Paper Trading Service",
@@ -38,6 +50,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# EPIC-17: Observability middleware
+app.add_middleware(CorrelationMiddleware)
+app.add_middleware(MetricsMiddleware, service_name="papertradingservice")
+
+# EPIC-17: Deep health checks + metrics
+configure_health("papertradingservice", "2.0.0")
+
+async def _check_postgres():
+    import time as _t
+    from database import check_db_connection
+    start = _t.time()
+    ok = check_db_connection()
+    return ok, (_t.time() - start) * 1000
+
+DependencyCheck.register("postgresql", _check_postgres)
+app.include_router(health_router, tags=["health"])
+app.add_route("/metrics", metrics_endpoint, methods=["GET"])
 
 # Storage adapter
 storage = StorageAdapter()
@@ -406,17 +436,7 @@ def read_root():
         "storage_mode": "pg_only",
     }
 
-@app.get("/health")
-def health_check():
-    from database import check_db_connection
-    return {
-        "status": "healthy",
-        "service": "paper-trading-service",
-        "cache": price_cache.stats(),
-        "circuit_breaker": yfinance_breaker.stats(),
-        "storage_mode": "pg_only",
-        "db_connected": check_db_connection(),
-    }
+# /health, /health/ready, /health/live provided by ai_trading_common health_router
 
 @app.get("/api/paper/account", response_model=PaperAccount)
 def get_account(token_data: dict = Depends(verify_token)):
