@@ -3,24 +3,59 @@ Paper Trading Service
 Simulated trading environment with realistic execution and fees
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from datetime import datetime, timezone
 import os
-import logging
+from pathlib import Path
+import sys
+import time
+import uuid
+import structlog
 import yfinance as yf
 
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
+for import_path in (CURRENT_DIR, PROJECT_ROOT):
+    import_path_str = str(import_path)
+    if import_path_str not in sys.path:
+        sys.path.insert(0, import_path_str)
+
+from ai_trading_common.logging_config import setup_logging, get_logger
 from storage import StorageAdapter
 
-logger = logging.getLogger(__name__)
+setup_logging("papertradingservice")
+logger = get_logger()
 
 app = FastAPI(
     title="Paper Trading Service",
     description="Simulated trading environment",
     version="2.0.0"
 )
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    correlation_id = request.headers.get("x-correlation-id") or str(uuid.uuid4())
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(correlation_id=correlation_id)
+    start_time = time.perf_counter()
+    try:
+        response = await call_next(request)
+    finally:
+        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        status_code = locals().get("response").status_code if "response" in locals() else 500
+        logger.info(
+            "request_completed",
+            method=request.method,
+            endpoint=request.url.path,
+            status_code=status_code,
+            duration_ms=duration_ms,
+        )
+        structlog.contextvars.clear_contextvars()
+    return response
 
 # CORS configuration from environment
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
@@ -36,6 +71,15 @@ app.add_middleware(
 
 # Storage adapter
 storage = StorageAdapter()
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info(
+        "papertradingservice_startup",
+        version="2.0.0",
+        cors_origins=CORS_ORIGINS,
+    )
 
 # Trading configuration
 SLIPPAGE_PERCENT = 0.1  # 0.1% slippage
@@ -107,14 +151,20 @@ def get_current_price(ticker: str) -> float:
                 time.sleep(1)
                 continue
         except Exception as e:
-            logger.warning(f"Error fetching price for {ticker} (attempt {attempt + 1}/{max_retries}): {e}")
+            logger.warning(
+                "paper_price_fetch_failed",
+                ticker=ticker,
+                attempt=attempt + 1,
+                max_retries=max_retries,
+                error=str(e),
+            )
             if attempt < max_retries - 1:
                 time.sleep(1)
 
     # All retries failed — serve stale cache
     stale = price_cache.get_stale(cache_key)
     if stale is not None:
-        logger.info(f"Serving stale cached price for {ticker}: {stale}")
+        logger.info("paper_stale_price_served", ticker=ticker, price=stale)
         return stale
     return 0.0
 
@@ -259,4 +309,5 @@ def get_orders(token_data: dict = Depends(verify_token)):
 
 if __name__ == "__main__":
     import uvicorn
+    logger.info("papertradingservice_started_successfully")
     uvicorn.run(app, host="0.0.0.0", port=8005)
