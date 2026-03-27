@@ -2,20 +2,29 @@
 StorageAdapter for PaperTradingService — PostgreSQL-only.
 """
 
-import logging
+from pathlib import Path
+import sys
 from typing import Dict, Optional, List
 
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
+for import_path in (CURRENT_DIR, PROJECT_ROOT):
+    import_path_str = str(import_path)
+    if import_path_str not in sys.path:
+        sys.path.insert(0, import_path_str)
+
+from ai_trading_common.logging_config import get_logger
 import database
 from repository import PaperTradingRepository
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 STARTING_CASH = 100000.0
 
 
 class StorageAdapter:
     def __init__(self):
-        logger.info("PaperTrading StorageAdapter initialized (pg_only)")
+        logger.info("papertrading_storage_adapter_initialized", storage_mode="pg_only")
 
     # Read
     def get_account(self, user_id: str) -> Dict:
@@ -27,7 +36,7 @@ class StorageAdapter:
             return repo.to_account_dict(account)
         except Exception as e:
             db.rollback()
-            logger.error(f"PG read failed: {e}")
+            logger.error("papertrading_read_failed", error=str(e))
             raise
         finally:
             db.close()

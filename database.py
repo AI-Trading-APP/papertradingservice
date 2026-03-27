@@ -5,9 +5,19 @@ Database configuration for PaperTradingService.
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 import os
-import logging
+from pathlib import Path
+import sys
 
-logger = logging.getLogger(__name__)
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
+for import_path in (CURRENT_DIR, PROJECT_ROOT):
+    import_path_str = str(import_path)
+    if import_path_str not in sys.path:
+        sys.path.insert(0, import_path_str)
+
+from ai_trading_common.logging_config import get_logger
+
+logger = get_logger()
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -50,5 +60,5 @@ def check_db_connection() -> bool:
             conn.execute(text("SELECT 1"))
         return True
     except Exception as e:
-        logger.error(f"Database connection check failed: {e}")
+        logger.error("papertrading_db_connection_check_failed", error=str(e))
         return False
