@@ -10,11 +10,28 @@ from typing import List, Optional, Dict
 from datetime import datetime, timezone
 import os
 import logging
+import threading
+import time
 import yfinance as yf
 
 from storage import StorageAdapter
+from circuit_breaker import yfinance_breaker
+from db_cache import load_cached_prices_from_db, get_price_from_db, save_prices_batch_to_db
+from price_cache import price_cache, PRICE_TTL
 
-logger = logging.getLogger(__name__)
+# EPIC-17: Observability
+from ai_trading_common import (
+    setup_logging, get_logger,
+    CorrelationMiddleware,
+    health_router, DependencyCheck, configure_health,
+    MetricsMiddleware, metrics_endpoint,
+    setup_sentry,
+)
+
+setup_logging("papertradingservice")
+logger = get_logger(__name__)
+
+setup_sentry(service_name="papertradingservice", version="2.0.0")
 
 app = FastAPI(
     title="Paper Trading Service",
@@ -34,6 +51,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# EPIC-17: Observability middleware
+app.add_middleware(CorrelationMiddleware)
+app.add_middleware(MetricsMiddleware, service_name="papertradingservice")
+
+# EPIC-17: Deep health checks + metrics
+configure_health("papertradingservice", "2.0.0")
+
+async def _check_postgres():
+    import time as _t
+    from database import check_db_connection
+    start = _t.time()
+    ok = check_db_connection()
+    return ok, (_t.time() - start) * 1000
+
+DependencyCheck.register("postgresql", _check_postgres)
+app.include_router(health_router, tags=["health"])
+app.add_route("/metrics", metrics_endpoint, methods=["GET"])
+
 # Storage adapter
 storage = StorageAdapter()
 
@@ -41,6 +76,9 @@ storage = StorageAdapter()
 SLIPPAGE_PERCENT = 0.1  # 0.1% slippage
 COMMISSION_PER_TRADE = 0.0  # $0 commission (like Robinhood)
 STARTING_CASH = 100000.0  # $100,000 starting capital
+
+# Limit order fill checker shutdown flag
+_fill_checker_stop = threading.Event()
 
 # Models
 class Order(BaseModel):
@@ -52,7 +90,7 @@ class Order(BaseModel):
 
 class OrderResponse(BaseModel):
     orderId: str
-    status: str  # "filled", "rejected"
+    status: str  # "filled", "pending", "rejected"
     filledPrice: Optional[float] = None
     filledQuantity: Optional[float] = None
     message: str
@@ -78,38 +116,54 @@ class PaperAccount(BaseModel):
 
 
 def get_current_price(ticker: str) -> float:
-    """Get current stock price with write-through cache and retry."""
-    import time
-    from price_cache import price_cache, PRICE_TTL
+    """Get current stock price via 3-layer cache: Memory -> DB -> yfinance."""
+    import time as _time
 
     cache_key = f"price:{ticker}"
+
+    # Layer 1: Memory cache
     cached, is_fresh = price_cache.get(cache_key)
     if cached is not None and is_fresh:
         return cached
 
+    # Layer 2: DB cache
+    db_price = get_price_from_db(ticker)
+    if db_price is not None and db_price > 0:
+        price_cache.set(cache_key, db_price, PRICE_TTL)
+        return db_price
+
+    # Layer 3: yfinance with circuit breaker + retry
     max_retries = 3
     for attempt in range(max_retries):
-        try:
+        def _fetch_1d():
             stock = yf.Ticker(ticker)
             data = stock.history(period="1d")
             if not data.empty:
-                price = float(data['Close'].iloc[-1])
-                price_cache.set(cache_key, price, PRICE_TTL)
-                return price
+                return float(data['Close'].iloc[-1])
+            return None
 
+        price = yfinance_breaker.call(_fetch_1d, fallback=lambda: None)
+        if price is not None:
+            price_cache.set(cache_key, price, PRICE_TTL)
+            save_prices_batch_to_db([{"ticker": ticker, "price": price}])
+            return price
+
+        # Try 5d fallback
+        def _fetch_5d():
+            stock = yf.Ticker(ticker)
             data = stock.history(period="5d")
             if not data.empty:
-                price = float(data['Close'].iloc[-1])
-                price_cache.set(cache_key, price, PRICE_TTL)
-                return price
+                return float(data['Close'].iloc[-1])
+            return None
 
-            if attempt < max_retries - 1:
-                time.sleep(1)
-                continue
-        except Exception as e:
-            logger.warning(f"Error fetching price for {ticker} (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(1)
+        price = yfinance_breaker.call(_fetch_5d, fallback=lambda: None)
+        if price is not None:
+            price_cache.set(cache_key, price, PRICE_TTL)
+            save_prices_batch_to_db([{"ticker": ticker, "price": price}])
+            return price
+
+        if attempt < max_retries - 1:
+            _time.sleep(1)
 
     # All retries failed — serve stale cache
     stale = price_cache.get_stale(cache_key)
@@ -126,13 +180,77 @@ def apply_slippage(price: float, side: str) -> float:
     else:
         return price - slippage
 
+def get_batch_prices(tickers: list) -> dict:
+    """Fetch prices for multiple tickers via 3-layer cache: Memory -> DB -> yfinance."""
+    results = {}
+    to_fetch_db = []
+
+    # Layer 1: Memory cache
+    for ticker in tickers:
+        cache_key = f"price:{ticker}"
+        cached, is_fresh = price_cache.get(cache_key)
+        if cached is not None and is_fresh:
+            results[ticker] = cached
+        else:
+            to_fetch_db.append(ticker)
+
+    if not to_fetch_db:
+        return results
+
+    # Layer 2: DB cache
+    to_fetch_yf = []
+    for ticker in to_fetch_db:
+        db_price = get_price_from_db(ticker)
+        if db_price is not None and db_price > 0:
+            price_cache.set(f"price:{ticker}", db_price, PRICE_TTL)
+            results[ticker] = db_price
+        else:
+            to_fetch_yf.append(ticker)
+
+    if not to_fetch_yf:
+        return results
+
+    # Layer 3: yfinance with circuit breaker
+    def _batch_download():
+        return yf.download(to_fetch_yf, period="5d", threads=True, progress=False)
+
+    df = yfinance_breaker.call(_batch_download, fallback=lambda: None)
+    db_entries = []
+
+    if df is not None:
+        for ticker in to_fetch_yf:
+            try:
+                closes = df["Close"].dropna() if len(to_fetch_yf) == 1 else df[ticker]["Close"].dropna()
+                if not closes.empty:
+                    price = float(closes.iloc[-1])
+                    price_cache.set(f"price:{ticker}", price, PRICE_TTL)
+                    results[ticker] = price
+                    db_entries.append({"ticker": ticker, "price": price})
+                else:
+                    results[ticker] = price_cache.get_stale(f"price:{ticker}") or 0.0
+            except Exception:
+                results[ticker] = price_cache.get_stale(f"price:{ticker}") or 0.0
+    else:
+        for ticker in to_fetch_yf:
+            results[ticker] = price_cache.get_stale(f"price:{ticker}") or 0.0
+
+    if db_entries:
+        save_prices_batch_to_db(db_entries)
+
+    return results
+
+
 def calculate_account_metrics(account: Dict) -> Dict:
-    """Calculate account metrics with current prices"""
+    """Calculate account metrics with batch-fetched current prices."""
     total_market_value = account['cash']
     initial_value = STARTING_CASH
 
+    # Batch fetch all prices at once
+    tickers = [p['ticker'] for p in account['positions']]
+    prices = get_batch_prices(tickers) if tickers else {}
+
     for position in account['positions']:
-        current_price = get_current_price(position['ticker'])
+        current_price = prices.get(position['ticker'], 0.0)
         position['currentPrice'] = current_price
 
         market_value = position['quantity'] * current_price
@@ -156,6 +274,158 @@ def verify_token(authorization: Optional[str] = None) -> dict:
     """Simple token verification"""
     return {"user_id": "user_1"}  # Mock user
 
+
+# --- Startup: warm memory cache from DB ---
+@app.on_event("startup")
+def startup_warm_cache():
+    """Load cached prices from DB into memory cache on startup."""
+    try:
+        rows = load_cached_prices_from_db()
+        count = 0
+        for row in rows:
+            ticker = row.get("ticker")
+            price = row.get("price", 0.0)
+            if ticker and price > 0:
+                price_cache.set(f"price:{ticker}", price, PRICE_TTL)
+                count += 1
+        logger.info(f"Startup cache warm: loaded {count} prices from DB into memory")
+    except Exception as e:
+        logger.error(f"Startup cache warm failed: {e}")
+
+
+# --- Startup: limit order fill checker daemon ---
+@app.on_event("startup")
+def start_fill_checker():
+    """Start background daemon thread to check pending limit orders every 30s."""
+    _fill_checker_stop.clear()
+    t = threading.Thread(target=_limit_order_fill_loop, daemon=True, name="fill-checker")
+    t.start()
+    logger.info("Limit order fill checker daemon started")
+
+
+@app.on_event("shutdown")
+def stop_fill_checker():
+    """Signal the fill checker daemon to stop."""
+    _fill_checker_stop.set()
+    logger.info("Limit order fill checker daemon stopped")
+
+
+def _limit_order_fill_loop():
+    """Background loop: check pending limit orders every 30 seconds."""
+    from sqlalchemy import text as sa_text
+    from database import engine
+
+    while not _fill_checker_stop.is_set():
+        try:
+            _check_and_fill_pending_orders(engine, sa_text)
+        except Exception as e:
+            logger.error(f"Fill checker error: {e}")
+        _fill_checker_stop.wait(30)
+
+
+def _check_and_fill_pending_orders(engine, sa_text):
+    """Query pending orders and fill those whose limit price is now favorable."""
+    from decimal import Decimal
+
+    with engine.begin() as conn:
+        rows = conn.execute(sa_text(
+            "SELECT o.id, o.account_id, o.ticker, o.side, o.quantity, o.limit_price "
+            "FROM paper_orders o WHERE o.status = 'pending'"
+        )).fetchall()
+
+        if not rows:
+            return
+
+        # Collect tickers and fetch current prices
+        tickers = list({r[2] for r in rows})
+        prices = get_batch_prices(tickers)
+
+        for row in rows:
+            order_id, account_id, ticker, side, quantity, limit_price = row
+            current_price = prices.get(ticker, 0.0)
+            if current_price <= 0:
+                continue
+
+            limit_px = float(limit_price)
+            should_fill = False
+            if side == "buy" and current_price <= limit_px:
+                should_fill = True
+            elif side == "sell" and current_price >= limit_px:
+                should_fill = True
+
+            if not should_fill:
+                continue
+
+            qty = Decimal(str(float(quantity)))
+            px = Decimal(str(limit_px))
+            now = datetime.now(timezone.utc)
+
+            if side == "buy":
+                total_cost = qty * px
+                # Check sufficient cash
+                acct = conn.execute(sa_text(
+                    "SELECT cash FROM paper_accounts WHERE id = :aid"
+                ), {"aid": account_id}).fetchone()
+                if not acct or Decimal(str(float(acct[0]))) < total_cost:
+                    continue
+
+                # Deduct cash
+                conn.execute(sa_text(
+                    "UPDATE paper_accounts SET cash = cash - :cost, version = version + 1 WHERE id = :aid"
+                ), {"cost": float(total_cost), "aid": account_id})
+
+                # Upsert position
+                pos = conn.execute(sa_text(
+                    "SELECT id, quantity, avg_cost_basis FROM paper_positions "
+                    "WHERE account_id = :aid AND ticker = :t"
+                ), {"aid": account_id, "t": ticker}).fetchone()
+                if pos:
+                    old_qty = Decimal(str(float(pos[1])))
+                    old_basis = Decimal(str(float(pos[2])))
+                    new_qty = old_qty + qty
+                    new_basis = ((old_qty * old_basis) + (qty * px)) / new_qty
+                    conn.execute(sa_text(
+                        "UPDATE paper_positions SET quantity = :q, avg_cost_basis = :b WHERE id = :pid"
+                    ), {"q": float(new_qty), "b": float(new_basis), "pid": pos[0]})
+                else:
+                    conn.execute(sa_text(
+                        "INSERT INTO paper_positions (account_id, ticker, quantity, avg_cost_basis) "
+                        "VALUES (:aid, :t, :q, :b)"
+                    ), {"aid": account_id, "t": ticker, "q": float(qty), "b": float(px)})
+
+            else:  # sell
+                # Check sufficient shares
+                pos = conn.execute(sa_text(
+                    "SELECT id, quantity FROM paper_positions "
+                    "WHERE account_id = :aid AND ticker = :t"
+                ), {"aid": account_id, "t": ticker}).fetchone()
+                if not pos or Decimal(str(float(pos[1]))) < qty:
+                    continue
+
+                proceeds = qty * px
+                conn.execute(sa_text(
+                    "UPDATE paper_accounts SET cash = cash + :p, version = version + 1 WHERE id = :aid"
+                ), {"p": float(proceeds), "aid": account_id})
+
+                new_qty = Decimal(str(float(pos[1]))) - qty
+                if new_qty == 0:
+                    conn.execute(sa_text(
+                        "DELETE FROM paper_positions WHERE id = :pid"
+                    ), {"pid": pos[0]})
+                else:
+                    conn.execute(sa_text(
+                        "UPDATE paper_positions SET quantity = :q WHERE id = :pid"
+                    ), {"q": float(new_qty), "pid": pos[0]})
+
+            # Mark order as filled
+            conn.execute(sa_text(
+                "UPDATE paper_orders SET status = 'filled', filled_price = :px, "
+                "filled_quantity = :qty, filled_at = :now WHERE id = :oid"
+            ), {"px": float(px), "qty": float(qty), "now": now, "oid": order_id})
+
+            logger.info(f"Filled pending order {order_id}: {side} {float(qty)} {ticker} @ ${float(px):.2f}")
+
+
 # Routes
 @app.get("/")
 def read_root():
@@ -166,17 +436,7 @@ def read_root():
         "storage_mode": "pg_only",
     }
 
-@app.get("/health")
-def health_check():
-    from price_cache import price_cache
-    from database import check_db_connection
-    return {
-        "status": "healthy",
-        "service": "paper-trading-service",
-        "cache": price_cache.stats(),
-        "storage_mode": "pg_only",
-        "db_connected": check_db_connection(),
-    }
+# /health, /health/ready, /health/live provided by ai_trading_common health_router
 
 @app.get("/api/paper/account", response_model=PaperAccount)
 def get_account(token_data: dict = Depends(verify_token)):
@@ -218,11 +478,22 @@ def place_order(order: Order, token_data: dict = Depends(verify_token)):
         elif order.side == "sell" and order.limitPrice <= market_price:
             execution_price = order.limitPrice
         else:
-            return OrderResponse(
-                orderId="",
-                status="rejected",
-                message="Limit price not favorable for immediate execution"
-            )
+            # Limit price not immediately favorable — create pending order
+            try:
+                result = storage.create_pending_order(
+                    user_id=user_id,
+                    ticker=order.ticker,
+                    side=order.side,
+                    quantity=order.quantity,
+                    limit_price=order.limitPrice,
+                )
+                return OrderResponse(**result)
+            except Exception as e:
+                return OrderResponse(
+                    orderId="",
+                    status="rejected",
+                    message=f"Failed to create pending order: {e}",
+                )
 
     # Execute order via storage adapter
     try:

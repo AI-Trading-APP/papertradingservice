@@ -125,6 +125,39 @@ class PaperTradingRepository:
             "message": f"Order filled at ${float(px):.2f}",
         }
 
+    def create_pending_order(self, user_id: int, ticker: str, side: str,
+                              quantity: float, limit_price: float) -> Dict:
+        """Create a pending limit order without executing (no cash/position change)."""
+        qty = Decimal(str(quantity))
+        lp = Decimal(str(limit_price))
+
+        account = self.get_or_create_account(user_id)
+        now = datetime.now(timezone.utc)
+
+        order = PaperOrderDB(
+            account_id=account.id,
+            ticker=ticker,
+            order_type="limit",
+            side=side,
+            quantity=qty,
+            limit_price=lp,
+            filled_price=None,
+            filled_quantity=None,
+            status="pending",
+            timestamp=now,
+            filled_at=None,
+        )
+        self.db.add(order)
+        self.db.flush()
+
+        return {
+            "orderId": f"order_{order.id}",
+            "status": "pending",
+            "filledPrice": None,
+            "filledQuantity": None,
+            "message": f"Limit order pending — {side} {quantity} {ticker} @ ${limit_price:.2f}",
+        }
+
     def reset_account(self, user_id: int) -> Dict:
         """Reset account: delete positions/orders, restore cash."""
         account = self.get_account(user_id)

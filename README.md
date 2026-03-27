@@ -99,43 +99,7 @@ curl -X POST http://localhost:8005/api/paper/reset \
 
 ## Data Storage
 
-Account data is stored in `paper_accounts.json`:
-
-```json
-{
-  "user_1": {
-    "userId": "user_1",
-    "cash": 98500.0,
-    "positions": [
-      {
-        "ticker": "AAPL",
-        "quantity": 10,
-        "avgCostBasis": 150.15,
-        "currentPrice": 155.00,
-        "marketValue": 1550.00,
-        "unrealizedPL": 48.50,
-        "unrealizedPLPercent": 3.23
-      }
-    ],
-    "orders": [
-      {
-        "orderId": "order_1",
-        "ticker": "AAPL",
-        "type": "market",
-        "side": "buy",
-        "quantity": 10,
-        "filledPrice": 150.15,
-        "filledQuantity": 10,
-        "status": "filled",
-        "timestamp": "2025-11-13T06:00:00.000Z"
-      }
-    ],
-    "totalValue": 100048.50,
-    "totalPL": 48.50,
-    "totalPLPercent": 0.05,
-    "createdAt": "2025-11-13T05:00:00.000Z"
-  }
-}
+Account data (positions, orders, balances) is stored in PostgreSQL, managed via the shared database layer.
 ```
 
 ## Notes
