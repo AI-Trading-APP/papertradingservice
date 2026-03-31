@@ -60,6 +60,23 @@ class StorageAdapter:
         finally:
             db.close()
 
+    # Create pending limit order (no cash/position change)
+    def create_pending_order(self, user_id: str, ticker: str, side: str,
+                             quantity: float, limit_price: float) -> Dict:
+        db = database.SessionLocal()
+        try:
+            repo = PaperTradingRepository(db)
+            result = repo.create_pending_order(
+                self._resolve_uid(user_id), ticker, side, quantity, limit_price,
+            )
+            db.commit()
+            return result
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
     # Reset
     def reset_account(self, user_id: str) -> Dict:
         db = database.SessionLocal()
