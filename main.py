@@ -23,7 +23,9 @@ for import_path in (CURRENT_DIR, PROJECT_ROOT):
     if import_path_str not in sys.path:
         sys.path.insert(0, import_path_str)
 
+from ai_trading_common import CorrelationMiddleware
 from ai_trading_common.logging_config import setup_logging, get_logger
+from ai_trading_common.metrics import MetricsMiddleware, metrics_endpoint
 from storage import StorageAdapter
 
 setup_logging("papertradingservice")
@@ -36,9 +38,12 @@ app = FastAPI(
 )
 
 
+app.add_middleware(CorrelationMiddleware)
+app.add_middleware(MetricsMiddleware, service_name="paper-trading-service")
+
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
-    correlation_id = request.headers.get("x-correlation-id") or str(uuid.uuid4())
+    correlation_id = getattr(request.state, "correlation_id", request.headers.get("x-correlation-id") or str(uuid.uuid4()))
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(correlation_id=correlation_id)
     start_time = time.perf_counter()
@@ -207,6 +212,10 @@ def verify_token(authorization: Optional[str] = None) -> dict:
     return {"user_id": "user_1"}  # Mock user
 
 # Routes
+@app.get("/metrics", include_in_schema=False)
+async def prometheus_metrics(request: Request):
+    return await metrics_endpoint(request)
+
 @app.get("/")
 def read_root():
     return {
@@ -311,3 +320,6 @@ if __name__ == "__main__":
     import uvicorn
     logger.info("papertradingservice_started_successfully")
     uvicorn.run(app, host="0.0.0.0", port=8005)
+
+
+
