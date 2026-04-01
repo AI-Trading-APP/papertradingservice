@@ -18,6 +18,8 @@ def test_health_returns_200(client):
     body = resp.json()
     assert body["status"] == "healthy"
     assert body["service"] == "paper-trading-service"
+    assert body["version"] == "2.0.0"
+    assert body["dependencies"] == []
 
 
 # ------------------------------------------------------------------

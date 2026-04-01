@@ -21,9 +21,15 @@ for import_path in (CURRENT_DIR, PROJECT_ROOT):
     if import_path_str not in sys.path:
         sys.path.insert(0, import_path_str)
 
-from ai_trading_common import CorrelationMiddleware
+from ai_trading_common import (
+    CorrelationMiddleware,
+    DependencyCheck,
+    check_postgresql,
+    configure_health,
+)
 from ai_trading_common.logging_config import setup_logging, get_logger
 from ai_trading_common.metrics import MetricsMiddleware, metrics_endpoint
+from database import SessionLocal
 from storage import StorageAdapter
 from circuit_breaker import yfinance_breaker
 from db_cache import load_cached_prices_from_db, get_price_from_db, save_prices_batch_to_db
@@ -52,6 +58,10 @@ app = FastAPI(
 
 app.add_middleware(CorrelationMiddleware)
 app.add_middleware(MetricsMiddleware, service_name="paper-trading-service")
+
+configure_health(app, "paper-trading-service", "2.0.0")
+DependencyCheck.clear()
+DependencyCheck.register("postgresql", lambda: check_postgresql(session_factory=SessionLocal))
 
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
