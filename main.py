@@ -3,7 +3,7 @@ Paper Trading Service
 Simulated trading environment with realistic execution and fees
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
@@ -12,6 +12,9 @@ import os
 import logging
 import threading
 import time
+from pathlib import Path
+import sys
+
 import yfinance as yf
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -26,28 +29,21 @@ from ai_trading_common import (
     DependencyCheck,
     check_postgresql,
     configure_health,
+    register_exception_handlers,
+    setup_sentry,
 )
 from ai_trading_common.logging_config import setup_logging, get_logger
 from ai_trading_common.metrics import MetricsMiddleware, metrics_endpoint
-from database import SessionLocal
+from database import SessionLocal, check_db_connection
 from storage import StorageAdapter
 from circuit_breaker import yfinance_breaker
 from db_cache import load_cached_prices_from_db, get_price_from_db, save_prices_batch_to_db
 from price_cache import price_cache, PRICE_TTL
 
-# EPIC-17: Observability
-from ai_trading_common import (
-    setup_logging, get_logger,
-    CorrelationMiddleware,
-    health_router, DependencyCheck, configure_health,
-    MetricsMiddleware, metrics_endpoint,
-    setup_sentry,
-)
-
 setup_logging("papertradingservice")
 logger = get_logger(__name__)
-
 setup_sentry(service_name="papertradingservice", version="2.0.0")
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 app = FastAPI(
     title="Paper Trading Service",
@@ -55,39 +51,8 @@ app = FastAPI(
     version="2.0.0"
 )
 
-
-app.add_middleware(CorrelationMiddleware)
 app.add_middleware(MetricsMiddleware, service_name="paper-trading-service")
-
-configure_health(app, "paper-trading-service", "2.0.0")
-DependencyCheck.clear()
-DependencyCheck.register("postgresql", lambda: check_postgresql(session_factory=SessionLocal))
-
-@app.middleware("http")
-async def request_logging_middleware(request: Request, call_next):
-    correlation_id = getattr(request.state, "correlation_id", request.headers.get("x-correlation-id") or str(uuid.uuid4()))
-    structlog.contextvars.clear_contextvars()
-    structlog.contextvars.bind_contextvars(correlation_id=correlation_id)
-    start_time = time.perf_counter()
-    try:
-        response = await call_next(request)
-    finally:
-        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-        status_code = locals().get("response").status_code if "response" in locals() else 500
-        logger.info(
-            "request_completed",
-            method=request.method,
-            endpoint=request.url.path,
-            status_code=status_code,
-            duration_ms=duration_ms,
-        )
-        structlog.contextvars.clear_contextvars()
-    return response
-
-# CORS configuration from environment
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
-
-# CORS middleware
+app.add_middleware(CorrelationMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -96,23 +61,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# EPIC-17: Observability middleware
-app.add_middleware(CorrelationMiddleware)
-app.add_middleware(MetricsMiddleware, service_name="papertradingservice")
-
-# EPIC-17: Deep health checks + metrics
-configure_health("papertradingservice", "2.0.0")
+configure_health(app, "paper-trading-service", "2.0.0")
+DependencyCheck.clear()
+DependencyCheck.register("postgresql", lambda: check_postgresql(session_factory=SessionLocal))
 
 async def _check_postgres():
     import time as _t
-    from database import check_db_connection
     start = _t.time()
     ok = check_db_connection()
     return ok, (_t.time() - start) * 1000
 
 DependencyCheck.register("postgresql", _check_postgres)
-app.include_router(health_router, tags=["health"])
 app.add_route("/metrics", metrics_endpoint, methods=["GET"])
+register_exception_handlers(app)
 
 # Storage adapter
 storage = StorageAdapter()
