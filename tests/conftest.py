@@ -169,6 +169,16 @@ def auth_headers():
 
 
 @pytest.fixture()
+def missing_user_id_headers():
+    token = jwt.encode(
+        {"sub": "user@example.com"},
+        TEST_JWT_SECRET,
+        algorithm=TEST_JWT_ALGORITHM,
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture()
 def seeded_account():
     """
     Pre-seed an account for user_id=1 with starting cash and no positions.

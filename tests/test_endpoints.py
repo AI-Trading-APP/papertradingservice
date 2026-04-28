@@ -190,6 +190,12 @@ def test_requires_auth(raw_client):
     assert resp.status_code == 401
 
 
+def test_rejects_token_missing_user_id(raw_client, missing_user_id_headers):
+    resp = raw_client.get("/api/paper/account", headers=missing_user_id_headers)
+    assert resp.status_code == 401
+    assert "user_id" in resp.json()["detail"]
+
+
 def test_accepts_auth_cookie(raw_client, auth_headers):
     token = auth_headers["Authorization"].removeprefix("Bearer ").strip()
     raw_client.cookies.set("auth_token", token)

@@ -173,6 +173,16 @@ def _decode_token(token: str) -> dict:
         )
 
 
+def _require_user_id(token_data: dict) -> str:
+    user_id = token_data.get("user_id")
+    if user_id is None or (isinstance(user_id, str) and not user_id.strip()):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token missing required user_id claim",
+        )
+    return str(user_id)
+
+
 def verify_token(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
@@ -180,10 +190,14 @@ def verify_token(
     """Verify user JWT from cookie or Bearer header."""
     cookie_token = request.cookies.get("auth_token")
     if cookie_token:
-        return _decode_token(cookie_token)
+        payload = _decode_token(cookie_token)
+        _require_user_id(payload)
+        return payload
 
     if credentials and credentials.credentials:
-        return _decode_token(credentials.credentials)
+        payload = _decode_token(credentials.credentials)
+        _require_user_id(payload)
+        return payload
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -215,7 +229,7 @@ def health_check():
 @app.get("/api/paper/account", response_model=PaperAccount)
 def get_account(token_data: dict = Depends(verify_token)):
     """Get paper trading account"""
-    user_id = str(token_data.get("user_id"))
+    user_id = _require_user_id(token_data)
     account = storage.get_account(user_id)
     account = calculate_account_metrics(account)
     return account
@@ -223,7 +237,7 @@ def get_account(token_data: dict = Depends(verify_token)):
 @app.post("/api/paper/order", response_model=OrderResponse)
 def place_order(order: Order, token_data: dict = Depends(verify_token)):
     """Place a paper trading order"""
-    user_id = str(token_data.get("user_id"))
+    user_id = _require_user_id(token_data)
 
     # Ensure account exists
     storage.get_account(user_id)
@@ -280,14 +294,14 @@ def place_order(order: Order, token_data: dict = Depends(verify_token)):
 @app.post("/api/paper/reset")
 def reset_account(token_data: dict = Depends(verify_token)):
     """Reset paper trading account to starting state"""
-    user_id = str(token_data.get("user_id"))
+    user_id = _require_user_id(token_data)
     result = storage.reset_account(user_id)
     return result
 
 @app.get("/api/paper/orders")
 def get_orders(token_data: dict = Depends(verify_token)):
     """Get order history"""
-    user_id = str(token_data.get("user_id"))
+    user_id = _require_user_id(token_data)
     orders = storage.get_orders(user_id)
     return {"orders": orders}
 
