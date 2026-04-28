@@ -3,7 +3,7 @@ Paper Trading Service
 Simulated trading environment with realistic execution and fees
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
@@ -12,26 +12,40 @@ import os
 import logging
 import threading
 import time
+from pathlib import Path
+import sys
+
 import yfinance as yf
 
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
+for import_path in (CURRENT_DIR, PROJECT_ROOT):
+    import_path_str = str(import_path)
+    if import_path_str not in sys.path:
+        sys.path.insert(0, import_path_str)
+
+from ai_trading_common import (
+    CorrelationMiddleware,
+    DependencyCheck,
+    MetricsMiddleware,
+    configure_health,
+    get_logger,
+    metrics_endpoint,
+    register_exception_handlers,
+    setup_logging,
+    setup_sentry,
+)
+from database import SessionLocal, check_db_connection
+from health_checks import check_postgresql
 from storage import StorageAdapter
 from circuit_breaker import yfinance_breaker
 from db_cache import load_cached_prices_from_db, get_price_from_db, save_prices_batch_to_db
 from price_cache import price_cache, PRICE_TTL
 
-# EPIC-17: Observability
-from ai_trading_common import (
-    setup_logging, get_logger,
-    CorrelationMiddleware,
-    health_router, DependencyCheck, configure_health,
-    MetricsMiddleware, metrics_endpoint,
-    setup_sentry,
-)
-
 setup_logging("papertradingservice")
 logger = get_logger(__name__)
-
 setup_sentry(service_name="papertradingservice", version="2.0.0")
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 app = FastAPI(
     title="Paper Trading Service",
@@ -39,10 +53,8 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# CORS configuration from environment
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
-
-# CORS middleware
+app.add_middleware(MetricsMiddleware, service_name="paper-trading-service")
+app.add_middleware(CorrelationMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -51,23 +63,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# EPIC-17: Observability middleware
-app.add_middleware(CorrelationMiddleware)
-app.add_middleware(MetricsMiddleware, service_name="papertradingservice")
+configure_health(app, "paper-trading-service", "2.0.0")
+DependencyCheck.clear()
+DependencyCheck.register("postgresql", check_postgresql)
 
-# EPIC-17: Deep health checks + metrics
-configure_health("papertradingservice", "2.0.0")
-
-async def _check_postgres():
-    import time as _t
-    from database import check_db_connection
-    start = _t.time()
-    ok = check_db_connection()
-    return ok, (_t.time() - start) * 1000
-
-DependencyCheck.register("postgresql", _check_postgres)
-app.include_router(health_router, tags=["health"])
 app.add_route("/metrics", metrics_endpoint, methods=["GET"])
+register_exception_handlers(app)
 
 # Storage adapter
 storage = StorageAdapter()
@@ -427,6 +428,10 @@ def _check_and_fill_pending_orders(engine, sa_text):
 
 
 # Routes
+@app.get("/metrics", include_in_schema=False)
+async def prometheus_metrics(request: Request):
+    return await metrics_endpoint(request)
+
 @app.get("/")
 def read_root():
     return {
@@ -531,3 +536,6 @@ def get_orders(token_data: dict = Depends(verify_token)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8005)
+
+
+
