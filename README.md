@@ -99,7 +99,7 @@ curl -X POST http://localhost:8005/api/paper/reset \
 
 ## Data Storage
 
-Account data is stored in `paper_accounts.json`:
+Account data is stored in PostgreSQL. API responses use the following structure:
 
 ```json
 {

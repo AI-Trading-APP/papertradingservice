@@ -3,8 +3,10 @@ Paper Trading Service
 Simulated trading environment with realistic execution and fees
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import ExpiredSignatureError, JWTError, jwt
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from datetime import datetime, timezone
@@ -15,6 +17,9 @@ import yfinance as yf
 from storage import StorageAdapter
 
 logger = logging.getLogger(__name__)
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+security = HTTPBearer(auto_error=False)
 
 app = FastAPI(
     title="Paper Trading Service",
@@ -152,9 +157,38 @@ def calculate_account_metrics(account: Dict) -> Dict:
 
     return account
 
-def verify_token(authorization: Optional[str] = None) -> dict:
-    """Simple token verification"""
-    return {"user_id": "user_1"}  # Mock user
+
+def _decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired",
+        )
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+        )
+
+
+def verify_token(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+) -> dict:
+    """Verify user JWT from cookie or Bearer header."""
+    cookie_token = request.cookies.get("auth_token")
+    if cookie_token:
+        return _decode_token(cookie_token)
+
+    if credentials and credentials.credentials:
+        return _decode_token(credentials.credentials)
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Not authenticated",
+    )
 
 # Routes
 @app.get("/")
