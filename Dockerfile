@@ -10,20 +10,16 @@ ENV PYTHONUNBUFFERED=1 \
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
-    git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Copy requirements and install dependencies
-COPY papertradingservice/requirements.txt ./requirements.txt
-COPY ai-trading-common /tmp/ai-trading-common
-RUN grep -v '^git+https://github.com/AI-Trading-APP/ai-trading-common.git$' requirements.txt > requirements.docker.txt && \
-    pip install --no-cache-dir /tmp/ai-trading-common && \
-    pip install --no-cache-dir -r requirements.docker.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY papertradingservice/main.py papertradingservice/database.py papertradingservice/models.py papertradingservice/price_cache.py papertradingservice/repository.py papertradingservice/storage.py papertradingservice/__init__.py ./
+COPY main.py .
 
 # Create data directory
 RUN mkdir -p /app/data

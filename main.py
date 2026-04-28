@@ -27,14 +27,16 @@ for import_path in (CURRENT_DIR, PROJECT_ROOT):
 from ai_trading_common import (
     CorrelationMiddleware,
     DependencyCheck,
-    check_postgresql,
+    MetricsMiddleware,
     configure_health,
+    get_logger,
+    metrics_endpoint,
     register_exception_handlers,
+    setup_logging,
     setup_sentry,
 )
-from ai_trading_common.logging_config import setup_logging, get_logger
-from ai_trading_common.metrics import MetricsMiddleware, metrics_endpoint
 from database import SessionLocal, check_db_connection
+from health_checks import check_postgresql
 from storage import StorageAdapter
 from circuit_breaker import yfinance_breaker
 from db_cache import load_cached_prices_from_db, get_price_from_db, save_prices_batch_to_db
@@ -63,15 +65,8 @@ app.add_middleware(
 
 configure_health(app, "paper-trading-service", "2.0.0")
 DependencyCheck.clear()
-DependencyCheck.register("postgresql", lambda: check_postgresql(session_factory=SessionLocal))
+DependencyCheck.register("postgresql", check_postgresql)
 
-async def _check_postgres():
-    import time as _t
-    start = _t.time()
-    ok = check_db_connection()
-    return ok, (_t.time() - start) * 1000
-
-DependencyCheck.register("postgresql", _check_postgres)
 app.add_route("/metrics", metrics_endpoint, methods=["GET"])
 register_exception_handlers(app)
 
