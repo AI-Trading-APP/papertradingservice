@@ -5,6 +5,8 @@ Simulated trading environment with realistic execution and fees
 
 from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import ExpiredSignatureError, JWTError, jwt
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from datetime import datetime, timezone
@@ -35,22 +37,51 @@ from ai_trading_common import (
     setup_logging,
     setup_sentry,
 )
-from database import SessionLocal, check_db_connection
-from health_checks import check_postgresql
-from storage import StorageAdapter
-from circuit_breaker import yfinance_breaker
-from db_cache import load_cached_prices_from_db, get_price_from_db, save_prices_batch_to_db
-from price_cache import price_cache, PRICE_TTL
+
+try:
+    from database import SessionLocal, check_db_connection
+except ImportError:  # pragma: no cover - supports package imports
+    from .database import SessionLocal, check_db_connection
+
+try:
+    from health_checks import check_postgresql
+except ImportError:  # pragma: no cover - supports package imports
+    from .health_checks import check_postgresql
+
+try:
+    from storage import StorageAdapter
+except ImportError:  # pragma: no cover - supports package imports
+    from .storage import StorageAdapter
+
+try:
+    from circuit_breaker import yfinance_breaker
+except ImportError:  # pragma: no cover - supports package imports
+    from .circuit_breaker import yfinance_breaker
+
+try:
+    from db_cache import load_cached_prices_from_db, get_price_from_db, save_prices_batch_to_db
+except ImportError:  # pragma: no cover - supports package imports
+    from .db_cache import load_cached_prices_from_db, get_price_from_db, save_prices_batch_to_db
+
+try:
+    from price_cache import PRICE_TTL, price_cache
+except ImportError:  # pragma: no cover - supports package imports
+    from .price_cache import PRICE_TTL, price_cache
+
+APP_VERSION = "2.0.0"
 
 setup_logging("papertradingservice")
 logger = get_logger(__name__)
-setup_sentry(service_name="papertradingservice", version="2.0.0")
+setup_sentry(service_name="papertradingservice", version=APP_VERSION)
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+security = HTTPBearer(auto_error=False)
 
 app = FastAPI(
     title="Paper Trading Service",
     description="Simulated trading environment",
-    version="2.0.0"
+    version=APP_VERSION
 )
 
 app.add_middleware(MetricsMiddleware, service_name="paper-trading-service")
@@ -63,7 +94,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-configure_health(app, "paper-trading-service", "2.0.0")
+configure_health(app, "paper-trading-service", APP_VERSION)
 DependencyCheck.clear()
 DependencyCheck.register("postgresql", check_postgresql)
 
@@ -271,9 +302,38 @@ def calculate_account_metrics(account: Dict) -> Dict:
 
     return account
 
-def verify_token(authorization: Optional[str] = None) -> dict:
-    """Simple token verification"""
-    return {"user_id": "user_1"}  # Mock user
+
+def _decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired",
+        )
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+        )
+
+
+def verify_token(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+) -> dict:
+    """Verify user JWT from cookie or Bearer header."""
+    cookie_token = request.cookies.get("auth_token")
+    if cookie_token:
+        return _decode_token(cookie_token)
+
+    if credentials and credentials.credentials:
+        return _decode_token(credentials.credentials)
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Not authenticated",
+    )
 
 
 # --- Startup: warm memory cache from DB ---
@@ -437,7 +497,7 @@ def read_root():
     return {
         "service": "Paper Trading Service",
         "status": "running",
-        "version": "2.0.0",
+        "version": APP_VERSION,
         "storage_mode": "pg_only",
     }
 
