@@ -3,7 +3,7 @@ Paper Trading Service
 Simulated trading environment with realistic execution and fees
 """
 
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
@@ -13,6 +13,7 @@ import logging
 import threading
 import time
 import yfinance as yf
+from jose import jwt as jose_jwt, JWTError
 
 from storage import StorageAdapter
 from circuit_breaker import yfinance_breaker
@@ -68,6 +69,10 @@ async def _check_postgres():
 DependencyCheck.register("postgresql", _check_postgres)
 app.include_router(health_router, tags=["health"])
 app.add_route("/metrics", metrics_endpoint, methods=["GET"])
+
+# JWT auth config
+_JWT_SECRET = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+_JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 
 # Storage adapter
 storage = StorageAdapter()
@@ -270,9 +275,19 @@ def calculate_account_metrics(account: Dict) -> Dict:
 
     return account
 
-def verify_token(authorization: Optional[str] = None) -> dict:
-    """Simple token verification"""
-    return {"user_id": "user_1"}  # Mock user
+def verify_token(request: Request) -> dict:
+    """Verify JWT from auth_token cookie (priority) or Authorization: Bearer header."""
+    token = request.cookies.get("auth_token")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    try:
+        return jose_jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials")
 
 
 # --- Startup: warm memory cache from DB ---
