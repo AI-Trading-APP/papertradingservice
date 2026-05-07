@@ -14,8 +14,12 @@ for import_path in (CURRENT_DIR, PROJECT_ROOT):
         sys.path.insert(0, import_path_str)
 
 from ai_trading_common.logging_config import get_logger
-import database
-from repository import PaperTradingRepository
+try:
+    import database
+    from repository import PaperTradingRepository
+except ImportError:  # pragma: no cover - supports package imports
+    from . import database
+    from .repository import PaperTradingRepository
 
 logger = get_logger()
 

@@ -2,14 +2,17 @@
 PaperTradingRepository — ACID-compliant data access for paper trading.
 """
 
-from decimal import Decimal
 from datetime import datetime, timezone
-from typing import Optional, Dict, List
+from decimal import Decimal
+from typing import Dict, List, Optional
 
-from sqlalchemy.orm import Session
 from sqlalchemy import and_
+from sqlalchemy.orm import Session
 
-from models import PaperAccountDB, PaperPositionDB, PaperOrderDB
+try:
+    from models import PaperAccountDB, PaperOrderDB, PaperPositionDB
+except ImportError:  # pragma: no cover - supports package imports
+    from .models import PaperAccountDB, PaperOrderDB, PaperPositionDB
 
 STARTING_CASH = Decimal("100000.00")
 

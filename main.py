@@ -3,15 +3,16 @@ Paper Trading Service
 Simulated trading environment with realistic execution and fees
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Request, status
+import os
+import logging
+from typing import Dict, List, Optional
+
+import yfinance as yf
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import ExpiredSignatureError, JWTError, jwt
 from pydantic import BaseModel
-from typing import List, Optional, Dict
-from datetime import datetime, timezone
-import os
-import logging
 import threading
 import time
 from pathlib import Path
@@ -25,6 +26,7 @@ for import_path in (CURRENT_DIR, PROJECT_ROOT):
     import_path_str = str(import_path)
     if import_path_str not in sys.path:
         sys.path.insert(0, import_path_str)
+from datetime import datetime, timezone
 
 from ai_trading_common import (
     CorrelationMiddleware,

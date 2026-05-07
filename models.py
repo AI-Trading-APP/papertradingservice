@@ -8,7 +8,10 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 
-from database import Base
+try:
+    from database import Base
+except ImportError:  # pragma: no cover - supports package imports
+    from .database import Base
 
 
 class PaperAccountDB(Base):
