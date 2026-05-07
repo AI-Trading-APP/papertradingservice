@@ -64,8 +64,11 @@ os.environ["JWT_ALGORITHM"] = "HS256"
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+from sqlalchemy import text
 
 import database as db_mod
+from database import ensure_cached_prices_table
+from circuit_breaker import yfinance_breaker
 from models import PaperAccountDB, PaperPositionDB, PaperOrderDB
 
 # Override engine with StaticPool so all connections share the same in-memory DB
@@ -116,6 +119,24 @@ def _make_yf_ticker(ticker_symbol: str):
     return mock_ticker
 
 
+def _make_yf_download(tickers, *args, **kwargs):
+    """Return a fake yf.download result that mirrors the batch price shape."""
+    if isinstance(tickers, str):
+        ticker_list = [t for t in tickers.split() if t]
+    else:
+        ticker_list = list(tickers)
+
+    frames = {
+        ticker: pd.DataFrame({"Close": [MOCK_PRICES.get(ticker, DEFAULT_MOCK_PRICE)]})
+        for ticker in ticker_list
+    }
+
+    if len(ticker_list) == 1:
+        return next(iter(frames.values()))
+
+    return pd.concat(frames, axis=1)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -124,6 +145,9 @@ def _make_yf_ticker(ticker_symbol: str):
 def setup_database():
     """Create tables before each test, drop after."""
     Base.metadata.create_all(bind=engine)
+    ensure_cached_prices_table()
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM cached_prices"))
     yield
     Base.metadata.drop_all(bind=engine)
 
@@ -131,8 +155,12 @@ def setup_database():
 @pytest.fixture(autouse=True)
 def _patch_yfinance():
     """Globally patch yfinance.Ticker for every test."""
+    yfinance_breaker.failures = 0
+    yfinance_breaker.state = "CLOSED"
+    yfinance_breaker.last_failure_time = 0.0
     with patch("yfinance.Ticker", side_effect=_make_yf_ticker):
-        yield
+        with patch("yfinance.download", side_effect=_make_yf_download):
+            yield
 
 
 @pytest.fixture()

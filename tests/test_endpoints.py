@@ -243,5 +243,5 @@ def test_zero_quantity_rejected(client, seeded_account):
     # The service fills with 0 shares at 0 total cost — no explicit validation
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "filled"
-    assert body["filledQuantity"] == 0
+    assert body["status"] == "rejected"
+    assert "Quantity must be greater than zero" in body["message"]

@@ -2,6 +2,8 @@
 Database configuration for PaperTradingService.
 """
 
+from datetime import datetime, timezone
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 import os
@@ -44,6 +46,47 @@ else:
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
+
+def _sqlite_cached_prices_ddl() -> str:
+    return """
+        CREATE TABLE IF NOT EXISTS cached_prices (
+            ticker TEXT PRIMARY KEY,
+            price REAL NOT NULL,
+            change REAL,
+            change_pct REAL,
+            name TEXT,
+            sector TEXT,
+            market_cap REAL,
+            updated_at TIMESTAMP NOT NULL
+        )
+    """
+
+
+def _postgres_cached_prices_ddl() -> str:
+    return """
+        CREATE TABLE IF NOT EXISTS cached_prices (
+            ticker VARCHAR(16) PRIMARY KEY,
+            price NUMERIC(15, 4) NOT NULL,
+            change NUMERIC(15, 4),
+            change_pct NUMERIC(15, 4),
+            name TEXT,
+            sector TEXT,
+            market_cap NUMERIC(20, 4),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """
+
+
+def ensure_cached_prices_table() -> None:
+    """Create the DB cache table if it does not exist yet."""
+    ddl = _sqlite_cached_prices_ddl() if engine.dialect.name == "sqlite" else _postgres_cached_prices_ddl()
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def get_db():

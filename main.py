@@ -5,6 +5,7 @@ Simulated trading environment with realistic execution and fees
 
 import os
 import logging
+import importlib
 from typing import Dict, List, Optional
 
 import yfinance as yf
@@ -41,9 +42,9 @@ from ai_trading_common import (
 )
 
 try:
-    from database import SessionLocal, check_db_connection
+    from database import SessionLocal, check_db_connection, ensure_cached_prices_table
 except ImportError:  # pragma: no cover - supports package imports
-    from .database import SessionLocal, check_db_connection
+    from .database import SessionLocal, check_db_connection, ensure_cached_prices_table
 
 try:
     from health_checks import check_postgresql
@@ -149,21 +150,33 @@ class PaperAccount(BaseModel):
     createdAt: Optional[str] = None
 
 
+def _get_price_cache():
+    """
+    Resolve the active cache object at call time so tests that swap
+    `sys.modules["price_cache"].price_cache` are honored.
+    """
+    try:
+        return importlib.import_module("price_cache").price_cache
+    except Exception:
+        return price_cache
+
+
 def get_current_price(ticker: str) -> float:
     """Get current stock price via 3-layer cache: Memory -> DB -> yfinance."""
     import time as _time
 
     cache_key = f"price:{ticker}"
+    current_price_cache = _get_price_cache()
 
     # Layer 1: Memory cache
-    cached, is_fresh = price_cache.get(cache_key)
+    cached, is_fresh = current_price_cache.get(cache_key)
     if cached is not None and is_fresh:
         return cached
 
     # Layer 2: DB cache
     db_price = get_price_from_db(ticker)
     if db_price is not None and db_price > 0:
-        price_cache.set(cache_key, db_price, PRICE_TTL)
+        current_price_cache.set(cache_key, db_price, PRICE_TTL)
         return db_price
 
     # Layer 3: yfinance with circuit breaker + retry
@@ -178,7 +191,7 @@ def get_current_price(ticker: str) -> float:
 
         price = yfinance_breaker.call(_fetch_1d, fallback=lambda: None)
         if price is not None:
-            price_cache.set(cache_key, price, PRICE_TTL)
+            current_price_cache.set(cache_key, price, PRICE_TTL)
             save_prices_batch_to_db([{"ticker": ticker, "price": price}])
             return price
 
@@ -192,7 +205,7 @@ def get_current_price(ticker: str) -> float:
 
         price = yfinance_breaker.call(_fetch_5d, fallback=lambda: None)
         if price is not None:
-            price_cache.set(cache_key, price, PRICE_TTL)
+            current_price_cache.set(cache_key, price, PRICE_TTL)
             save_prices_batch_to_db([{"ticker": ticker, "price": price}])
             return price
 
@@ -200,7 +213,7 @@ def get_current_price(ticker: str) -> float:
             _time.sleep(1)
 
     # All retries failed — serve stale cache
-    stale = price_cache.get_stale(cache_key)
+    stale = current_price_cache.get_stale(cache_key)
     if stale is not None:
         logger.info(f"Serving stale cached price for {ticker}: {stale}")
         return stale
@@ -218,11 +231,12 @@ def get_batch_prices(tickers: list) -> dict:
     """Fetch prices for multiple tickers via 3-layer cache: Memory -> DB -> yfinance."""
     results = {}
     to_fetch_db = []
+    current_price_cache = _get_price_cache()
 
     # Layer 1: Memory cache
     for ticker in tickers:
         cache_key = f"price:{ticker}"
-        cached, is_fresh = price_cache.get(cache_key)
+        cached, is_fresh = current_price_cache.get(cache_key)
         if cached is not None and is_fresh:
             results[ticker] = cached
         else:
@@ -236,7 +250,7 @@ def get_batch_prices(tickers: list) -> dict:
     for ticker in to_fetch_db:
         db_price = get_price_from_db(ticker)
         if db_price is not None and db_price > 0:
-            price_cache.set(f"price:{ticker}", db_price, PRICE_TTL)
+            current_price_cache.set(f"price:{ticker}", db_price, PRICE_TTL)
             results[ticker] = db_price
         else:
             to_fetch_yf.append(ticker)
@@ -257,16 +271,16 @@ def get_batch_prices(tickers: list) -> dict:
                 closes = df["Close"].dropna() if len(to_fetch_yf) == 1 else df[ticker]["Close"].dropna()
                 if not closes.empty:
                     price = float(closes.iloc[-1])
-                    price_cache.set(f"price:{ticker}", price, PRICE_TTL)
+                    current_price_cache.set(f"price:{ticker}", price, PRICE_TTL)
                     results[ticker] = price
                     db_entries.append({"ticker": ticker, "price": price})
                 else:
-                    results[ticker] = price_cache.get_stale(f"price:{ticker}") or 0.0
+                    results[ticker] = current_price_cache.get_stale(f"price:{ticker}") or 0.0
             except Exception:
-                results[ticker] = price_cache.get_stale(f"price:{ticker}") or 0.0
+                results[ticker] = current_price_cache.get_stale(f"price:{ticker}") or 0.0
     else:
         for ticker in to_fetch_yf:
-            results[ticker] = price_cache.get_stale(f"price:{ticker}") or 0.0
+            results[ticker] = current_price_cache.get_stale(f"price:{ticker}") or 0.0
 
     if db_entries:
         save_prices_batch_to_db(db_entries)
@@ -343,13 +357,15 @@ def verify_token(
 def startup_warm_cache():
     """Load cached prices from DB into memory cache on startup."""
     try:
+        ensure_cached_prices_table()
+        current_price_cache = _get_price_cache()
         rows = load_cached_prices_from_db()
         count = 0
         for row in rows:
             ticker = row.get("ticker")
             price = row.get("price", 0.0)
             if ticker and price > 0:
-                price_cache.set(f"price:{ticker}", price, PRICE_TTL)
+                current_price_cache.set(f"price:{ticker}", price, PRICE_TTL)
                 count += 1
         logger.info(f"Startup cache warm: loaded {count} prices from DB into memory")
     except Exception as e:
@@ -505,6 +521,20 @@ def read_root():
 
 # /health, /health/ready, /health/live provided by ai_trading_common health_router
 
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "service": "paper-trading-service",
+        "version": APP_VERSION,
+        "dependencies": [],
+    }
+
+app.router.routes = [
+    route for route in app.router.routes
+    if getattr(route, "path", None) != "/health" or getattr(route, "endpoint", None) == health
+]
+
 @app.get("/api/paper/account", response_model=PaperAccount)
 def get_account(token_data: dict = Depends(verify_token)):
     """Get paper trading account"""
@@ -517,6 +547,13 @@ def get_account(token_data: dict = Depends(verify_token)):
 def place_order(order: Order, token_data: dict = Depends(verify_token)):
     """Place a paper trading order"""
     user_id = str(token_data.get("user_id"))
+
+    if order.quantity <= 0:
+        return OrderResponse(
+            orderId="",
+            status="rejected",
+            message="Quantity must be greater than zero",
+        )
 
     # Ensure account exists
     storage.get_account(user_id)
