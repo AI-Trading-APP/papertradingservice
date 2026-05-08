@@ -100,7 +100,7 @@ curl -X POST http://localhost:8005/api/paper/reset \
 ## Data Storage
 
 Account data (positions, orders, balances) is stored in PostgreSQL, managed via the shared database layer.
-```
+Account data (positions, orders, balances) is stored in PostgreSQL, managed via the shared database layer.
 
 ## Notes
 

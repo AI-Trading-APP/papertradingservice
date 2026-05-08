@@ -3,7 +3,7 @@ Shared fixtures for PaperTradingService tests.
 
 Key design decisions:
 - Uses SQLite in-memory database for test isolation (no JSON files).
-- verify_token is a simple mock returning {"user_id": "user_1"}.
+- Generates real JWTs matching the production auth dependency.
 - yfinance is patched globally so no network calls happen.
 - price_cache is a stub that always reports a cache miss.
 """
@@ -17,6 +17,7 @@ from unittest.mock import patch, MagicMock
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
+from jose import jwt
 
 # Ensure the parent directory is on sys.path so 'papertradingservice.main' is importable
 _PARENT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -57,12 +58,17 @@ sys.modules.setdefault("price_cache", _mock_price_cache_module)
 
 # Force SQLite for tests (must be set before importing database)
 os.environ["DATABASE_URL"] = "sqlite://"
+os.environ["JWT_SECRET_KEY"] = "paper-test-secret"
+os.environ["JWT_ALGORITHM"] = "HS256"
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+from sqlalchemy import text
 
 import database as db_mod
+from database import ensure_cached_prices_table
+from circuit_breaker import yfinance_breaker
 from models import PaperAccountDB, PaperPositionDB, PaperOrderDB
 
 # Override engine with StaticPool so all connections share the same in-memory DB
@@ -100,6 +106,8 @@ MOCK_PRICES = {
 }
 
 DEFAULT_MOCK_PRICE = 100.0  # fallback for any unknown ticker
+TEST_JWT_SECRET = os.environ["JWT_SECRET_KEY"]
+TEST_JWT_ALGORITHM = os.environ["JWT_ALGORITHM"]
 
 
 def _make_yf_ticker(ticker_symbol: str):
@@ -111,6 +119,24 @@ def _make_yf_ticker(ticker_symbol: str):
     return mock_ticker
 
 
+def _make_yf_download(tickers, *args, **kwargs):
+    """Return a fake yf.download result that mirrors the batch price shape."""
+    if isinstance(tickers, str):
+        ticker_list = [t for t in tickers.split() if t]
+    else:
+        ticker_list = list(tickers)
+
+    frames = {
+        ticker: pd.DataFrame({"Close": [MOCK_PRICES.get(ticker, DEFAULT_MOCK_PRICE)]})
+        for ticker in ticker_list
+    }
+
+    if len(ticker_list) == 1:
+        return next(iter(frames.values()))
+
+    return pd.concat(frames, axis=1)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -119,6 +145,9 @@ def _make_yf_ticker(ticker_symbol: str):
 def setup_database():
     """Create tables before each test, drop after."""
     Base.metadata.create_all(bind=engine)
+    ensure_cached_prices_table()
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM cached_prices"))
     yield
     Base.metadata.drop_all(bind=engine)
 
@@ -126,24 +155,45 @@ def setup_database():
 @pytest.fixture(autouse=True)
 def _patch_yfinance():
     """Globally patch yfinance.Ticker for every test."""
+    yfinance_breaker.failures = 0
+    yfinance_breaker.state = "CLOSED"
+    yfinance_breaker.last_failure_time = 0.0
     with patch("yfinance.Ticker", side_effect=_make_yf_ticker):
-        yield
+        with patch("yfinance.download", side_effect=_make_yf_download):
+            yield
 
 
 @pytest.fixture()
-def client():
+def client(auth_headers):
     """TestClient that talks to the PaperTradingService app."""
     from papertradingservice.main import app
-    return TestClient(app)
+    with TestClient(app) as c:
+        c.headers.update(auth_headers)
+        yield c
+
+
+@pytest.fixture()
+def raw_client():
+    """Bare TestClient without auth headers for authentication tests."""
+    from papertradingservice.main import app
+    with TestClient(app) as c:
+        yield c
 
 
 @pytest.fixture()
 def authed_client(client):
-    """
-    The service's verify_token always returns {"user_id": "user_1"} so no
-    special headers are needed, but this fixture makes intent explicit.
-    """
+    """Authenticated client alias used by older tests."""
     return client
+
+
+@pytest.fixture()
+def auth_headers():
+    token = jwt.encode(
+        {"sub": "user@example.com", "user_id": 1},
+        TEST_JWT_SECRET,
+        algorithm=TEST_JWT_ALGORITHM,
+    )
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture()

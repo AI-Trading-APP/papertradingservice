@@ -15,6 +15,7 @@ httpx==0.25.2
 
 # EPIC-17: Observability
 structlog>=24.1.0
-prometheus_client>=0.20.0
+prometheus-client>=0.20.0
 sentry-sdk[fastapi]>=1.40.0
+ai-trading-common @ git+https://github.com/AI-Trading-APP/ai-trading-common.git@v0.2.3
 

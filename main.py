@@ -10,40 +10,91 @@ from typing import List, Optional, Dict
 from datetime import datetime, timezone
 import os
 import logging
+import importlib
+from typing import Dict, List, Optional
+
+import yfinance as yf
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import ExpiredSignatureError, JWTError, jwt
+from pydantic import BaseModel
 import threading
 import time
+from pathlib import Path
+import sys
+
 import yfinance as yf
 from jose import jwt as jose_jwt, JWTError
 
-from storage import StorageAdapter
-from circuit_breaker import yfinance_breaker
-from db_cache import load_cached_prices_from_db, get_price_from_db, save_prices_batch_to_db
-from price_cache import price_cache, PRICE_TTL
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
+for import_path in (CURRENT_DIR, PROJECT_ROOT):
+    import_path_str = str(import_path)
+    if import_path_str not in sys.path:
+        sys.path.insert(0, import_path_str)
+from datetime import datetime, timezone
 
-# EPIC-17: Observability
 from ai_trading_common import (
-    setup_logging, get_logger,
     CorrelationMiddleware,
-    health_router, DependencyCheck, configure_health,
-    MetricsMiddleware, metrics_endpoint,
+    DependencyCheck,
+    MetricsMiddleware,
+    configure_health,
+    get_logger,
+    metrics_endpoint,
+    register_exception_handlers,
+    setup_logging,
     setup_sentry,
 )
 
+try:
+    from database import SessionLocal, check_db_connection, ensure_cached_prices_table
+except ImportError:  # pragma: no cover - supports package imports
+    from .database import SessionLocal, check_db_connection, ensure_cached_prices_table
+
+try:
+    from health_checks import check_postgresql
+except ImportError:  # pragma: no cover - supports package imports
+    from .health_checks import check_postgresql
+
+try:
+    from storage import StorageAdapter
+except ImportError:  # pragma: no cover - supports package imports
+    from .storage import StorageAdapter
+
+try:
+    from circuit_breaker import yfinance_breaker
+except ImportError:  # pragma: no cover - supports package imports
+    from .circuit_breaker import yfinance_breaker
+
+try:
+    from db_cache import load_cached_prices_from_db, get_price_from_db, save_prices_batch_to_db
+except ImportError:  # pragma: no cover - supports package imports
+    from .db_cache import load_cached_prices_from_db, get_price_from_db, save_prices_batch_to_db
+
+try:
+    from price_cache import PRICE_TTL, price_cache
+except ImportError:  # pragma: no cover - supports package imports
+    from .price_cache import PRICE_TTL, price_cache
+
+APP_VERSION = "2.0.0"
+
 setup_logging("papertradingservice")
 logger = get_logger(__name__)
-
-setup_sentry(service_name="papertradingservice", version="2.0.0")
+setup_sentry(service_name="papertradingservice", version=APP_VERSION)
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+security = HTTPBearer(auto_error=False)
 
 app = FastAPI(
     title="Paper Trading Service",
     description="Simulated trading environment",
-    version="2.0.0"
+    version=APP_VERSION
 )
 
-# CORS configuration from environment
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
-
-# CORS middleware
+app.add_middleware(MetricsMiddleware, service_name="paper-trading-service")
+app.add_middleware(CorrelationMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -52,23 +103,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# EPIC-17: Observability middleware
-app.add_middleware(CorrelationMiddleware)
-app.add_middleware(MetricsMiddleware, service_name="papertradingservice")
+configure_health(app, "paper-trading-service", APP_VERSION)
+DependencyCheck.clear()
+DependencyCheck.register("postgresql", check_postgresql)
 
-# EPIC-17: Deep health checks + metrics
-configure_health("papertradingservice", "2.0.0")
-
-async def _check_postgres():
-    import time as _t
-    from database import check_db_connection
-    start = _t.time()
-    ok = check_db_connection()
-    return ok, (_t.time() - start) * 1000
-
-DependencyCheck.register("postgresql", _check_postgres)
-app.include_router(health_router, tags=["health"])
 app.add_route("/metrics", metrics_endpoint, methods=["GET"])
+register_exception_handlers(app)
 
 # JWT auth config
 _JWT_SECRET = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
@@ -120,21 +160,33 @@ class PaperAccount(BaseModel):
     createdAt: Optional[str] = None
 
 
+def _get_price_cache():
+    """
+    Resolve the active cache object at call time so tests that swap
+    `sys.modules["price_cache"].price_cache` are honored.
+    """
+    try:
+        return importlib.import_module("price_cache").price_cache
+    except Exception:
+        return price_cache
+
+
 def get_current_price(ticker: str) -> float:
     """Get current stock price via 3-layer cache: Memory -> DB -> yfinance."""
     import time as _time
 
     cache_key = f"price:{ticker}"
+    current_price_cache = _get_price_cache()
 
     # Layer 1: Memory cache
-    cached, is_fresh = price_cache.get(cache_key)
+    cached, is_fresh = current_price_cache.get(cache_key)
     if cached is not None and is_fresh:
         return cached
 
     # Layer 2: DB cache
     db_price = get_price_from_db(ticker)
     if db_price is not None and db_price > 0:
-        price_cache.set(cache_key, db_price, PRICE_TTL)
+        current_price_cache.set(cache_key, db_price, PRICE_TTL)
         return db_price
 
     # Layer 3: yfinance with circuit breaker + retry
@@ -149,7 +201,7 @@ def get_current_price(ticker: str) -> float:
 
         price = yfinance_breaker.call(_fetch_1d, fallback=lambda: None)
         if price is not None:
-            price_cache.set(cache_key, price, PRICE_TTL)
+            current_price_cache.set(cache_key, price, PRICE_TTL)
             save_prices_batch_to_db([{"ticker": ticker, "price": price}])
             return price
 
@@ -163,7 +215,7 @@ def get_current_price(ticker: str) -> float:
 
         price = yfinance_breaker.call(_fetch_5d, fallback=lambda: None)
         if price is not None:
-            price_cache.set(cache_key, price, PRICE_TTL)
+            current_price_cache.set(cache_key, price, PRICE_TTL)
             save_prices_batch_to_db([{"ticker": ticker, "price": price}])
             return price
 
@@ -171,7 +223,7 @@ def get_current_price(ticker: str) -> float:
             _time.sleep(1)
 
     # All retries failed — serve stale cache
-    stale = price_cache.get_stale(cache_key)
+    stale = current_price_cache.get_stale(cache_key)
     if stale is not None:
         logger.info(f"Serving stale cached price for {ticker}: {stale}")
         return stale
@@ -189,11 +241,12 @@ def get_batch_prices(tickers: list) -> dict:
     """Fetch prices for multiple tickers via 3-layer cache: Memory -> DB -> yfinance."""
     results = {}
     to_fetch_db = []
+    current_price_cache = _get_price_cache()
 
     # Layer 1: Memory cache
     for ticker in tickers:
         cache_key = f"price:{ticker}"
-        cached, is_fresh = price_cache.get(cache_key)
+        cached, is_fresh = current_price_cache.get(cache_key)
         if cached is not None and is_fresh:
             results[ticker] = cached
         else:
@@ -207,7 +260,7 @@ def get_batch_prices(tickers: list) -> dict:
     for ticker in to_fetch_db:
         db_price = get_price_from_db(ticker)
         if db_price is not None and db_price > 0:
-            price_cache.set(f"price:{ticker}", db_price, PRICE_TTL)
+            current_price_cache.set(f"price:{ticker}", db_price, PRICE_TTL)
             results[ticker] = db_price
         else:
             to_fetch_yf.append(ticker)
@@ -228,16 +281,16 @@ def get_batch_prices(tickers: list) -> dict:
                 closes = df["Close"].dropna() if len(to_fetch_yf) == 1 else df[ticker]["Close"].dropna()
                 if not closes.empty:
                     price = float(closes.iloc[-1])
-                    price_cache.set(f"price:{ticker}", price, PRICE_TTL)
+                    current_price_cache.set(f"price:{ticker}", price, PRICE_TTL)
                     results[ticker] = price
                     db_entries.append({"ticker": ticker, "price": price})
                 else:
-                    results[ticker] = price_cache.get_stale(f"price:{ticker}") or 0.0
+                    results[ticker] = current_price_cache.get_stale(f"price:{ticker}") or 0.0
             except Exception:
-                results[ticker] = price_cache.get_stale(f"price:{ticker}") or 0.0
+                results[ticker] = current_price_cache.get_stale(f"price:{ticker}") or 0.0
     else:
         for ticker in to_fetch_yf:
-            results[ticker] = price_cache.get_stale(f"price:{ticker}") or 0.0
+            results[ticker] = current_price_cache.get_stale(f"price:{ticker}") or 0.0
 
     if db_entries:
         save_prices_batch_to_db(db_entries)
@@ -275,6 +328,38 @@ def calculate_account_metrics(account: Dict) -> Dict:
 
     return account
 
+
+def _decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired",
+        )
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+        )
+
+
+def verify_token(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+) -> dict:
+    """Verify user JWT from cookie or Bearer header."""
+    cookie_token = request.cookies.get("auth_token")
+    if cookie_token:
+        return _decode_token(cookie_token)
+
+    if credentials and credentials.credentials:
+        return _decode_token(credentials.credentials)
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Not authenticated",
+    )
 def verify_token(request: Request) -> dict:
     """Verify JWT from auth_token cookie (priority) or Authorization: Bearer header."""
     token = request.cookies.get("auth_token")
@@ -295,13 +380,15 @@ def verify_token(request: Request) -> dict:
 def startup_warm_cache():
     """Load cached prices from DB into memory cache on startup."""
     try:
+        ensure_cached_prices_table()
+        current_price_cache = _get_price_cache()
         rows = load_cached_prices_from_db()
         count = 0
         for row in rows:
             ticker = row.get("ticker")
             price = row.get("price", 0.0)
             if ticker and price > 0:
-                price_cache.set(f"price:{ticker}", price, PRICE_TTL)
+                current_price_cache.set(f"price:{ticker}", price, PRICE_TTL)
                 count += 1
         logger.info(f"Startup cache warm: loaded {count} prices from DB into memory")
     except Exception as e:
@@ -442,16 +529,34 @@ def _check_and_fill_pending_orders(engine, sa_text):
 
 
 # Routes
+@app.get("/metrics", include_in_schema=False)
+async def prometheus_metrics(request: Request):
+    return await metrics_endpoint(request)
+
 @app.get("/")
 def read_root():
     return {
         "service": "Paper Trading Service",
         "status": "running",
-        "version": "2.0.0",
+        "version": APP_VERSION,
         "storage_mode": "pg_only",
     }
 
 # /health, /health/ready, /health/live provided by ai_trading_common health_router
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "service": "paper-trading-service",
+        "version": APP_VERSION,
+        "dependencies": [],
+    }
+
+app.router.routes = [
+    route for route in app.router.routes
+    if getattr(route, "path", None) != "/health" or getattr(route, "endpoint", None) == health
+]
 
 @app.get("/api/paper/account", response_model=PaperAccount)
 def get_account(token_data: dict = Depends(verify_token)):
@@ -465,6 +570,13 @@ def get_account(token_data: dict = Depends(verify_token)):
 def place_order(order: Order, token_data: dict = Depends(verify_token)):
     """Place a paper trading order"""
     user_id = str(token_data.get("user_id"))
+
+    if order.quantity <= 0:
+        return OrderResponse(
+            orderId="",
+            status="rejected",
+            message="Quantity must be greater than zero",
+        )
 
     # Ensure account exists
     storage.get_account(user_id)
@@ -546,3 +658,6 @@ def get_orders(token_data: dict = Depends(verify_token)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8005)
+
+
+

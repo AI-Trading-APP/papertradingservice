@@ -18,6 +18,8 @@ def test_health_returns_200(client):
     body = resp.json()
     assert body["status"] == "healthy"
     assert body["service"] == "paper-trading-service"
+    assert body["version"] == "2.0.0"
+    assert body["dependencies"] == []
 
 
 # ------------------------------------------------------------------
@@ -185,25 +187,17 @@ def test_reset_clears_positions_and_orders(client, account_with_position):
 # Auth
 # ------------------------------------------------------------------
 
-def test_requires_auth(client):
-    """
-    verify_token currently always succeeds (returns mock user), so all
-    requests are 'authenticated'. This test documents that the dependency
-    is wired up — if verify_token were to raise, endpoints would 401.
-    We use FastAPI's dependency_overrides to swap verify_token at runtime.
-    """
-    from fastapi import HTTPException
-    from papertradingservice.main import app, verify_token
+def test_requires_auth(raw_client):
+    resp = raw_client.get("/api/paper/account")
+    assert resp.status_code == 401
 
-    def _raise():
-        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    app.dependency_overrides[verify_token] = _raise
-    try:
-        resp = client.get("/api/paper/account")
-        assert resp.status_code == 401
-    finally:
-        app.dependency_overrides.pop(verify_token, None)
+def test_accepts_auth_cookie(raw_client, auth_headers):
+    token = auth_headers["Authorization"].removeprefix("Bearer ").strip()
+    raw_client.cookies.set("auth_token", token)
+    resp = raw_client.get("/api/paper/account")
+    assert resp.status_code == 200
+    assert resp.json()["userId"] == "1"
 
 
 # ------------------------------------------------------------------
@@ -249,5 +243,5 @@ def test_zero_quantity_rejected(client, seeded_account):
     # The service fills with 0 shares at 0 total cost — no explicit validation
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "filled"
-    assert body["filledQuantity"] == 0
+    assert body["status"] == "rejected"
+    assert "Quantity must be greater than zero" in body["message"]

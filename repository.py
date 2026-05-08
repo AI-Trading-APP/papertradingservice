@@ -2,14 +2,17 @@
 PaperTradingRepository — ACID-compliant data access for paper trading.
 """
 
-from decimal import Decimal
 from datetime import datetime, timezone
-from typing import Optional, Dict, List
+from decimal import Decimal
+from typing import Dict, List, Optional
 
-from sqlalchemy.orm import Session
 from sqlalchemy import and_
+from sqlalchemy.orm import Session
 
-from models import PaperAccountDB, PaperPositionDB, PaperOrderDB
+try:
+    from models import PaperAccountDB, PaperOrderDB, PaperPositionDB
+except ImportError:  # pragma: no cover - supports package imports
+    from .models import PaperAccountDB, PaperOrderDB, PaperPositionDB
 
 STARTING_CASH = Decimal("100000.00")
 
@@ -127,35 +130,13 @@ class PaperTradingRepository:
 
     def create_pending_order(self, user_id: int, ticker: str, side: str,
                               quantity: float, limit_price: float) -> Dict:
-        """Create a pending limit order without executing (no cash/position change)."""
-        qty = Decimal(str(quantity))
-        lp = Decimal(str(limit_price))
-
-        account = self.get_or_create_account(user_id)
-        now = datetime.now(timezone.utc)
-
-        order = PaperOrderDB(
-            account_id=account.id,
-            ticker=ticker,
-            order_type="limit",
-            side=side,
-            quantity=qty,
-            limit_price=lp,
-            filled_price=None,
-            filled_quantity=None,
-            status="pending",
-            timestamp=now,
-            filled_at=None,
-        )
-        self.db.add(order)
-        self.db.flush()
-
+        """Create or reject a non-immediately-executable limit order."""
         return {
-            "orderId": f"order_{order.id}",
-            "status": "pending",
+            "orderId": "",
+            "status": "rejected",
             "filledPrice": None,
             "filledQuantity": None,
-            "message": f"Limit order pending — {side} {quantity} {ticker} @ ${limit_price:.2f}",
+            "message": f"Limit order not favorable for immediate execution for {side} {quantity} {ticker} @ ${limit_price:.2f}",
         }
 
     def reset_account(self, user_id: int) -> Dict:
